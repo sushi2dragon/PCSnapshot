@@ -1,0 +1,49 @@
+@import "tailwindcss";
+
+:root {
+  --color-accent: #4bbfc3;
+  --color-accent-hover: #3dadb1;
+  --bg-base: #1c1c1f;
+  --bg-card: #252528;
+  --bg-tile: #2a2a2d;
+  --bg-tile-hover: #303034;
+  --border-subtle: #3a3a3e;
+  --text-primary: #ffffff;
+  --text-secondary: #888888;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+/* Text entry and readable detail text stay selectable despite the app-wide
+   user-select: none (needed so users can copy names, paths, and error reasons). */
+input,
+textarea {
+  user-select: text;
+}
+
+#root {
+  min-height: 100vh;
+  background: var(--bg-base);
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}

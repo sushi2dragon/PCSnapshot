@@ -1,0 +1,5 @@
+[build]
+target-dir = "C:/cargo-build/pc-snapshot"
+# C: runs chronically low on space; the incremental cache alone grew to ~3 GB
+# and filled the disk mid-build. Re-enable if disk pressure eases.
+incremental = false
