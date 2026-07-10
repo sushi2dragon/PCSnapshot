@@ -1,0 +1,10 @@
+{
+  "name": "app.pcsnapshot.companion",
+  "description": "PC Snapshot Companion native messaging bridge",
+  "path": "C:\\Program Files\\PC Snapshot\\pc-snapshot-native-host.exe",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://REPLACE_WITH_CHROME_STORE_ID/",
+    "chrome-extension://REPLACE_WITH_EDGE_STORE_ID/"
+  ]
+}

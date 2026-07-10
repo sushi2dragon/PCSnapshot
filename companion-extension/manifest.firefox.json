@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "PC Snapshot Companion",
+  "description": "Captures browser window and tab layout for local PC Snapshot restores.",
+  "version": "0.1.0",
+  "permissions": ["tabs", "tabGroups", "nativeMessaging", "storage"],
+  "background": {
+    "scripts": ["src/background.js"],
+    "type": "module"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "pc-snapshot-companion@pcsnapshot.app",
+      "strict_min_version": "140.0"
+    }
+  }
+}

@@ -2,6 +2,7 @@
 name = "pc-snapshot"
 version = "0.1.0"
 edition = "2021"
+default-run = "pc-snapshot"
 
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset"] }
@@ -11,6 +12,7 @@ chrono = { version = "0.4", features = ["serde"] }
 xcap  = "0.0.14"
 image = { version = "0.25", default-features = false, features = ["png"] }
 sysinfo = "0.31"
+tokio = { version = "1.52", features = ["io-util", "net", "rt", "sync", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
@@ -23,6 +25,8 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Dwm",
     "Win32_System_Threading",
     "Win32_System_Com",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
 ] }
 
 [build-dependencies]

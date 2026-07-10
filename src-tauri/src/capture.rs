@@ -10,7 +10,7 @@
 //! Nothing here ever fails the capture wholesale: every fallible step degrades to a warning
 //! so a snapshot is always produced (per the error-handling spec).
 
-use crate::{ContextClue, ProcessInfo, WindowInfo, WindowPosition, WindowSize};
+use crate::{ContextClue, ProcessInfo, TerminalSession, WindowInfo, WindowPosition, WindowSize};
 use crate::classify::{self, Category};
 
 /// Structured result of inspecting the live desktop. The caller folds this into a `Snapshot`.
@@ -20,6 +20,10 @@ pub struct CapturedDesktop {
     pub context_clues: Vec<ContextClue>,
     pub restore_hints: Vec<String>,
     pub warnings: Vec<String>,
+    /// Per-terminal-window session (shell, real CWD, history). Computed here —
+    /// not in `lib.rs` — because it needs each window's owning PID, which is
+    /// dropped from `WindowInfo` before the caller sees it.
+    pub terminal_sessions: Vec<TerminalSession>,
 }
 
 impl CapturedDesktop {
@@ -30,6 +34,7 @@ impl CapturedDesktop {
             context_clues: vec![],
             restore_hints: vec![],
             warnings: vec![w],
+            terminal_sessions: vec![],
         }
     }
 }
@@ -145,6 +150,10 @@ pub fn capture_desktop(ignore_list: &[String]) -> CapturedDesktop {
         }
     }
 
+    // Terminal sessions need each window's owning PID, so compute them now —
+    // before enrichment consumes `windows` and drops the PID.
+    let terminal_sessions = crate::terminal::capture_terminal_sessions(&processes, &windows);
+
     // Enrich each window with its owning process's exe path.
     let enriched_windows: Vec<WindowInfo> = windows
         .into_iter()
@@ -172,6 +181,7 @@ pub fn capture_desktop(ignore_list: &[String]) -> CapturedDesktop {
         context_clues,
         restore_hints,
         warnings,
+        terminal_sessions,
     }
 }
 
@@ -198,15 +208,35 @@ fn capture_browser_tabs(
         return;
     }
 
-    // One (stem, hwnd) target per browser window, capped so a wall of browser
-    // windows can't blow the <3s capture budget.
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+
+    // Primary: parse each browser's on-disk session file to recover ALL open
+    // tabs (including inactive ones, which UI Automation cannot see).
+    let stems: HashSet<String> = browser_pids.values().cloned().collect();
+    let mut covered: HashSet<String> = HashSet::new();
+    for (stem, url) in crate::browser::read_open_tab_urls(&stems) {
+        covered.insert(stem.clone());
+        if seen.insert((stem.clone(), url.clone())) {
+            restore_hints.push(format!("browser_tab:{stem}:{url}"));
+            clues.push(ContextClue {
+                clue_type: "browser_tab".to_string(),
+                value: url,
+                confidence: 0.95,
+                source: "session_file".to_string(),
+            });
+        }
+    }
+
+    // Fallback: for any browser whose session file we couldn't read, grab at
+    // least the active tab per window via UI Automation. One (stem, hwnd) target
+    // per window, capped so a wall of browser windows can't blow the <3s budget.
     let targets: Vec<(String, isize)> = raw
         .iter()
         .filter_map(|w| browser_pids.get(&w.pid).map(|stem| (stem.clone(), w.hwnd)))
+        .filter(|(stem, _)| !covered.contains(stem))
         .take(12)
         .collect();
 
-    let mut seen: HashSet<(String, String)> = HashSet::new();
     for (stem, url) in crate::browser::read_active_tab_urls(&targets) {
         if seen.insert((stem.clone(), url.clone())) {
             restore_hints.push(format!("browser_tab:{stem}:{url}"));

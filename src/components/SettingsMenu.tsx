@@ -5,6 +5,8 @@ interface SettingsMenuProps {
   onImport: () => void;
   onHelp: () => void;
   onIgnoreList: () => void;
+  onToggleTerminalHook: () => void;
+  terminalHookEnabled: boolean;
 }
 
 const menuItems = [
@@ -16,6 +18,18 @@ const menuItems = [
     icon: (
       <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
         <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+      </svg>
+    ),
+  },
+  {
+    key: "terminalHook",
+    label: "Terminal Capture",
+    description: "Capture PowerShell working dirs",
+    danger: false,
+    icon: (
+      <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <polyline points="4 17 10 11 4 5" />
+        <line x1="12" y1="19" x2="20" y2="19" />
       </svg>
     ),
   },
@@ -59,7 +73,7 @@ const menuItems = [
   },
 ];
 
-export function SettingsMenu({ onClearAll, onImport, onHelp, onIgnoreList }: SettingsMenuProps) {
+export function SettingsMenu({ onClearAll, onImport, onHelp, onIgnoreList, onToggleTerminalHook, terminalHookEnabled }: SettingsMenuProps) {
   const [open, setOpen] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -121,6 +135,15 @@ export function SettingsMenu({ onClearAll, onImport, onHelp, onIgnoreList }: Set
           {menuItems.map((item, i) => {
             const isClearAll = item.key === "clearAll";
             const isConfirming = isClearAll && confirmClear;
+            const isTerminalHook = item.key === "terminalHook";
+            const label = isTerminalHook
+              ? `Terminal Capture: ${terminalHookEnabled ? "On" : "Off"}`
+              : item.label;
+            const description = isTerminalHook
+              ? terminalHookEnabled
+                ? "Click to disable (edits PowerShell profile)"
+                : "Click to enable (edits PowerShell profile)"
+              : item.description;
 
             return (
               <button
@@ -128,6 +151,7 @@ export function SettingsMenu({ onClearAll, onImport, onHelp, onIgnoreList }: Set
                 onClick={() => {
                   if (isClearAll) { handleClearAll(); return; }
                   if (item.key === "ignoreList") { onIgnoreList(); setOpen(false); }
+                  if (isTerminalHook) { onToggleTerminalHook(); setOpen(false); }
                   if (item.key === "import") { onImport(); setOpen(false); }
                   if (item.key === "help") { onHelp(); setOpen(false); }
                 }}
@@ -152,11 +176,11 @@ export function SettingsMenu({ onClearAll, onImport, onHelp, onIgnoreList }: Set
                 </span>
                 <div>
                   <p className="text-xs font-medium leading-tight">
-                    {isConfirming ? "Click again to confirm" : item.label}
+                    {isConfirming ? "Click again to confirm" : label}
                   </p>
                   {!isConfirming && (
                     <p className="text-xs leading-tight mt-0.5" style={{ color: "var(--text-secondary)" }}>
-                      {item.description}
+                      {description}
                     </p>
                   )}
                 </div>

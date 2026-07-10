@@ -3,12 +3,14 @@ use std::path::PathBuf;
 use tauri::Manager;
 
 mod browser;
+pub mod browser_bridge;
 mod capture;
 mod classify;
 pub(crate) mod config;
 mod context;
 mod restore;
 mod terminal;
+mod terminal_hook;
 
 /// Split a shell-style command string into tokens, respecting double-quoted segments.
 /// Used by capture (to build quoted cmd_lines) and restore (to parse them back).
@@ -35,7 +37,7 @@ pub(crate) fn tokenize(cmd: &str) -> Vec<String> {
 
 // ── Schema version ──────────────────────────────────────────────────────────
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const THUMBNAIL_WIDTH:  u32 = 480;
 const THUMBNAIL_HEIGHT: u32 = 270;
 
@@ -83,6 +85,82 @@ pub struct TerminalSession {
     pub window_title: String,
 }
 
+/// Browser identity as reported by the companion extension. The profile ID is
+/// generated and kept in extension-local storage; native browser IDs are not
+/// durable and must never be persisted as a restore key.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct BrowserIdentity {
+    pub family: String,
+    pub profile_instance_id: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct BrowserCapabilities {
+    pub tab_groups: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct BrowserBounds {
+    pub left: Option<i32>,
+    pub top: Option<i32>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct BrowserTab {
+    pub url: String,
+    pub title: String,
+    pub index: i32,
+    pub active: bool,
+    pub pinned: bool,
+    pub muted: bool,
+    pub discarded: bool,
+    pub group_key: Option<String>,
+    pub restorable: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct BrowserTabGroup {
+    pub key: String,
+    pub title: String,
+    pub color: String,
+    pub collapsed: bool,
+    pub index: Option<i32>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct BrowserWindow {
+    pub ordinal: u32,
+    pub bounds: BrowserBounds,
+    pub state: String,
+    pub focused: bool,
+    pub tabs: Vec<BrowserTab>,
+    pub groups: Vec<BrowserTabGroup>,
+}
+
+/// Structured, companion-derived browser state. This is intentionally separate
+/// from loose restore hints because it preserves window, tab-order, and group
+/// membership needed for a safe later reconciliation.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct BrowserSession {
+    pub protocol_version: u32,
+    pub browser: BrowserIdentity,
+    pub captured_at: String,
+    pub capabilities: BrowserCapabilities,
+    pub windows: Vec<BrowserWindow>,
+}
+
+fn deserialize_browser_sessions<'de, D>(deserializer: D) -> Result<Vec<BrowserSession>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Companion output is optional context. Preserve an otherwise valid
+    // snapshot when a future/partial extension payload cannot be understood.
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ContextClue {
     #[serde(rename = "type")]
@@ -107,6 +185,8 @@ pub struct Snapshot {
     pub thumbnail_path: String,
     #[serde(default)]
     pub terminal_sessions: Vec<TerminalSession>,
+    #[serde(default, deserialize_with = "deserialize_browser_sessions")]
+    pub browser_sessions: Vec<BrowserSession>,
 }
 
 /// Lightweight summary returned by list_snapshots — avoids loading full data.
@@ -237,6 +317,7 @@ fn capture_thumbnail(png_path: &PathBuf) -> Result<(), String> {
 async fn take_snapshot(
     app: tauri::AppHandle,
     name: String,
+    browser_bridge: tauri::State<'_, browser_bridge::BrowserBridge>,
 ) -> Result<CaptureResult, String> {
     let dir = snapshots_dir(&app)?;
 
@@ -256,19 +337,31 @@ async fn take_snapshot(
     let thumb_path = thumbnail_path_buf.clone();
     let thumb_handle = std::thread::spawn(move || capture_thumbnail(&thumb_path));
 
+    // Browser capture must begin while normal window enumeration and the
+    // screenshot run. It has its own short deadline and is never fatal.
+    let bridge = browser_bridge.inner().clone();
+    let browser_capture = tauri::async_runtime::spawn(async move {
+        bridge.capture(std::time::Duration::from_millis(1200)).await
+    });
+
     // Real capture engine: enumerate windows + processes on this thread.
     let cfg = config::load_config(&app);
     let captured = capture::capture_desktop(&cfg.ignore_list);
     let mut warnings: Vec<String> = captured.warnings;
+
+    let browser_reply = browser_capture.await.map_err(|e| format!("Browser bridge task failed: {e}"))?;
+    let has_browser = captured.processes.iter().any(|process| {
+        !process.exe_path.is_empty() && classify::classify(&process.exe_path, true).is_browser()
+    });
+    if has_browser || !browser_reply.sessions.is_empty() {
+        warnings.extend(browser_reply.warnings.clone());
+    }
 
     match thumb_handle.join() {
         Ok(Ok(())) => {}
         Ok(Err(e)) => warnings.push(format!("Thumbnail capture failed: {e}")),
         Err(_) => warnings.push("Thumbnail capture thread panicked".to_string()),
     }
-
-    let terminal_sessions =
-        terminal::capture_terminal_sessions(&captured.processes, &captured.windows);
 
     let snapshot = Snapshot {
         schema_version: SCHEMA_VERSION,
@@ -281,7 +374,8 @@ async fn take_snapshot(
         restore_hints: captured.restore_hints,
         warnings: warnings.clone(),
         thumbnail_path: thumbnail_path_buf.to_string_lossy().into_owned(),
-        terminal_sessions,
+        terminal_sessions: captured.terminal_sessions,
+        browser_sessions: browser_reply.sessions,
     };
 
     let json = serde_json::to_string_pretty(&snapshot)
@@ -300,6 +394,7 @@ async fn take_snapshot(
 async fn recapture_snapshot(
     app: tauri::AppHandle,
     id: String,
+    browser_bridge: tauri::State<'_, browser_bridge::BrowserBridge>,
 ) -> Result<CaptureResult, String> {
     let dir = snapshots_dir(&app)?;
     let existing_path = json_path(&dir, &id);
@@ -315,9 +410,22 @@ async fn recapture_snapshot(
     let thumb_tmp2 = thumb_tmp.clone();
     let thumb_handle = std::thread::spawn(move || capture_thumbnail(&thumb_tmp2));
 
+    let bridge = browser_bridge.inner().clone();
+    let browser_capture = tauri::async_runtime::spawn(async move {
+        bridge.capture(std::time::Duration::from_millis(1200)).await
+    });
+
     let cfg = config::load_config(&app);
     let captured = capture::capture_desktop(&cfg.ignore_list);
     let mut warnings: Vec<String> = captured.warnings;
+
+    let browser_reply = browser_capture.await.map_err(|e| format!("Browser bridge task failed: {e}"))?;
+    let has_browser = captured.processes.iter().any(|process| {
+        !process.exe_path.is_empty() && classify::classify(&process.exe_path, true).is_browser()
+    });
+    if has_browser || !browser_reply.sessions.is_empty() {
+        warnings.extend(browser_reply.warnings.clone());
+    }
 
     let thumb_ok = match thumb_handle.join() {
         Ok(Ok(())) => true,
@@ -331,9 +439,6 @@ async fn recapture_snapshot(
         }
     };
 
-    let terminal_sessions =
-        terminal::capture_terminal_sessions(&captured.processes, &captured.windows);
-
     let snapshot = Snapshot {
         schema_version: SCHEMA_VERSION,
         id: id.clone(),
@@ -345,7 +450,8 @@ async fn recapture_snapshot(
         restore_hints: captured.restore_hints,
         warnings: warnings.clone(),
         thumbnail_path: thumbnail_path_buf.to_string_lossy().into_owned(),
-        terminal_sessions,
+        terminal_sessions: captured.terminal_sessions,
+        browser_sessions: browser_reply.sessions,
     };
 
     // Write to temp file first, then rename — if capture fails the original is untouched.
@@ -402,6 +508,7 @@ async fn restore_snapshot(
     app: tauri::AppHandle,
     id: String,
     close_others: Option<bool>,
+    browser_bridge: tauri::State<'_, browser_bridge::BrowserBridge>,
 ) -> Result<RestoreResult, String> {
     let dir = snapshots_dir(&app)?;
     let path = json_path(&dir, &id);
@@ -416,12 +523,26 @@ async fn restore_snapshot(
     let close_others = close_others.unwrap_or(false);
     let cfg = config::load_config(&app);
     let ignore_list = cfg.ignore_list;
+    let sessions = snapshot.browser_sessions.clone();
+    let has_browser_sessions = !sessions.is_empty();
 
-    // Restore runs synchronous Win32 work; offload so we never block the async runtime.
-    let result =
-        tauri::async_runtime::spawn_blocking(move || restore::restore_desktop(&snapshot, close_others, &ignore_list))
+    let mut result =
+        tauri::async_runtime::spawn_blocking(move || {
+            restore::restore_desktop(
+                &snapshot,
+                close_others,
+                &ignore_list,
+                has_browser_sessions,
+            )
+        })
             .await
             .map_err(|e| format!("Restore task failed: {e}"))?;
+
+    if has_browser_sessions {
+        let reply = browser_bridge.inner().clone().restore(&sessions, close_others).await;
+        result.closed_items.extend(reply.closed_items);
+        result.warnings.extend(reply.warnings);
+    }
 
     Ok(result)
 }
@@ -574,11 +695,30 @@ async fn get_running_processes(app: tauri::AppHandle) -> Result<Vec<String>, Str
     Ok(stems)
 }
 
+/// Whether the PowerShell profile hook (mirrors $PWD into the window title so we
+/// can capture a terminal's live directory) is installed.
+#[tauri::command]
+async fn terminal_hook_status() -> Result<bool, String> {
+    Ok(terminal_hook::is_installed())
+}
+
+/// Install or remove the PowerShell directory-capture hook.
+#[tauri::command]
+async fn set_terminal_hook(enabled: bool) -> Result<String, String> {
+    if enabled {
+        terminal_hook::install()
+    } else {
+        terminal_hook::uninstall()
+    }
+}
+
 // ── App entry point ───────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let browser_bridge = browser_bridge::BrowserBridge::start();
     tauri::Builder::default()
+        .manage(browser_bridge)
         .invoke_handler(tauri::generate_handler![
             take_snapshot,
             recapture_snapshot,
@@ -591,7 +731,51 @@ pub fn run() {
             add_to_ignore_list,
             remove_from_ignore_list,
             get_running_processes,
+            terminal_hook_status,
+            set_terminal_hook,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod snapshot_schema_tests {
+    use super::Snapshot;
+
+    #[test]
+    fn v2_snapshot_without_browser_sessions_remains_readable() {
+        let snapshot: Snapshot = serde_json::from_str(r#"{
+            "schema_version": 2,
+            "id": "snap_1",
+            "name": "Old",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "processes": [],
+            "windows": [],
+            "context_clues": [],
+            "restore_hints": [],
+            "warnings": [],
+            "thumbnail_path": "C:/snapshot.png"
+        }"#).expect("v2 snapshots must remain readable");
+
+        assert!(snapshot.browser_sessions.is_empty());
+    }
+
+    #[test]
+    fn malformed_optional_browser_payload_does_not_corrupt_snapshot() {
+        let snapshot: Snapshot = serde_json::from_str(r#"{
+            "schema_version": 3,
+            "id": "snap_2",
+            "name": "Partial",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "processes": [],
+            "windows": [],
+            "context_clues": [],
+            "restore_hints": [],
+            "warnings": [],
+            "thumbnail_path": "C:/snapshot.png",
+            "browser_sessions": "not-an-array"
+        }"#).expect("browser context must not invalidate the desktop snapshot");
+
+        assert!(snapshot.browser_sessions.is_empty());
+    }
 }

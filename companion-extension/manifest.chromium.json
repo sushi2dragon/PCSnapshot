@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "PC Snapshot Companion",
+  "description": "Captures browser window and tab layout for local PC Snapshot restores.",
+  "version": "0.1.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAu+NZTJe2i+4pxhYwqmrq7NRKujEb8v1xyqTlt6tzq+Cx3g+k6V7O+RGfmnDcoUThQPH6uQ/ZgNMS6Io0jEH2MWuMqV4M/AP3NjLjhR+DaLtQHulqSQud0L+qq8d1Gv4eLpCkhybRuWaB3HCmqw9Vnaj/Gn4wbdMe4KGficcPDhZVUQRHv5bkhlUCD5c89w8RyenbSI4MpgPU+8E6jqy46TncdNcuzo4nJZlVxumfkAS7PwHdnckS7VWIB/QQuS8amz1KsGr8Kcl+q1u/k8MYD83ok3VQjs1WUhH+kVOlQPc+rgzopnU4v8z9oMJcakGmq11pPfklwfjfiWkhsvd8TwIDAQAB",
+  "permissions": ["tabs", "tabGroups", "nativeMessaging", "storage"],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  }
+}

@@ -15,6 +15,8 @@ interface SnapshotGridProps {
   onHelp: () => void;
   onRefresh: () => void;
   onIgnoreList: () => void;
+  onToggleTerminalHook: () => void;
+  terminalHookEnabled: boolean;
 }
 
 export function SnapshotGrid({
@@ -28,6 +30,8 @@ export function SnapshotGrid({
   onHelp,
   onRefresh,
   onIgnoreList,
+  onToggleTerminalHook,
+  terminalHookEnabled,
 }: SnapshotGridProps) {
   const [search, setSearch] = useState("");
   const [refreshing, setRefreshing] = useState(false);
@@ -188,6 +192,8 @@ export function SnapshotGrid({
               onImport={onImport}
               onHelp={onHelp}
               onIgnoreList={onIgnoreList}
+              onToggleTerminalHook={onToggleTerminalHook}
+              terminalHookEnabled={terminalHookEnabled}
             />
           </div>
         </div>

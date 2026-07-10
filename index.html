@@ -5,10 +5,24 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PC Snapshot</title>
-    <style>html,body,#root{background:#1c1c1f;margin:0}</style>
+    <style>
+      html,body,#root{background:#1c1c1f;margin:0}
+      /* Static splash: shown until React mounts and replaces #root. Bridges the
+         blank-window gap while the webview/dev server loads (worst case: a
+         cold Vite start over OneDrive-dehydrated node_modules). */
+      #boot{position:fixed;inset:0;display:flex;flex-direction:column;
+        align-items:center;justify-content:center;gap:16px;
+        font-family:system-ui,sans-serif;color:#6b6b70}
+      #boot .ring{width:28px;height:28px;border-radius:50%;
+        border:3px solid #2a2a2d;border-top-color:#4bbfc3;
+        animation:boot-spin .8s linear infinite}
+      @keyframes boot-spin{to{transform:rotate(360deg)}}
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div id="boot"><div class="ring"></div><div>Loading PC Snapshot…</div></div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

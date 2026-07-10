@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import { useSnapshots } from "./hooks/useSnapshots";
 import { EmptyState } from "./components/EmptyState";
 import { SnapshotGrid } from "./components/SnapshotGrid";
@@ -9,6 +9,7 @@ import { RestoreConfirmModal } from "./components/RestoreConfirmModal";
 import { IgnoreListModal } from "./components/IgnoreListModal";
 import { RecaptureConfirmModal } from "./components/RecaptureConfirmModal";
 import { isCurrentStateSaved, clearAllSnapshots } from "./commands/snapshots";
+import { terminalHookStatus, setTerminalHook } from "./commands/config";
 import type { RestoreResult } from "./types/snapshot";
 
 function App() {
@@ -23,6 +24,11 @@ function App() {
   const [saveFirstPendingId, setSaveFirstPendingId] = useState<string | null>(null);
   const [showIgnoreList, setShowIgnoreList] = useState(false);
   const [confirmRecapture, setConfirmRecapture] = useState<{ id: string; name: string } | null>(null);
+  const [terminalHookEnabled, setTerminalHookEnabled] = useState(false);
+
+  useEffect(() => {
+    terminalHookStatus().then(setTerminalHookEnabled).catch(() => {});
+  }, []);
 
   // Next free "Snapshot NN" number — derived from existing names (not the array
   // length) so deleting snapshots never produces a duplicate default name.
@@ -181,6 +187,17 @@ function App() {
     setToast({ message: "Refreshed", type: "success" });
   }, [refresh]);
 
+  const handleToggleTerminalHook = useCallback(async () => {
+    const next = !terminalHookEnabled;
+    try {
+      const message = await setTerminalHook(next);
+      setTerminalHookEnabled(next);
+      setToast({ message, type: "success" });
+    } catch (e) {
+      setToast({ message: `Terminal capture: ${e}`, type: "warning" });
+    }
+  }, [terminalHookEnabled]);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-screen" style={{ backgroundColor: "var(--bg-base)" }}>
@@ -208,6 +225,8 @@ function App() {
           onHelp={handleHelp}
           onRefresh={handleRefresh}
           onIgnoreList={() => setShowIgnoreList(true)}
+          onToggleTerminalHook={handleToggleTerminalHook}
+          terminalHookEnabled={terminalHookEnabled}
         />
       )}
 

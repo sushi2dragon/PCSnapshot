@@ -23,6 +23,43 @@ export interface TerminalSession {
   window_title: string;
 }
 
+export interface BrowserTab {
+  url: string;
+  title: string;
+  index: number;
+  active: boolean;
+  pinned: boolean;
+  muted: boolean;
+  discarded: boolean;
+  group_key: string | null;
+  restorable: boolean;
+}
+
+export interface BrowserTabGroup {
+  key: string;
+  title: string;
+  color: string;
+  collapsed: boolean;
+  index: number | null;
+}
+
+export interface BrowserWindow {
+  ordinal: number;
+  bounds: { left: number | null; top: number | null; width: number | null; height: number | null };
+  state: string;
+  focused: boolean;
+  tabs: BrowserTab[];
+  groups: BrowserTabGroup[];
+}
+
+export interface BrowserSession {
+  protocol_version: number;
+  browser: { family: string; profile_instance_id: string };
+  captured_at: string;
+  capabilities: { tab_groups: boolean };
+  windows: BrowserWindow[];
+}
+
 export interface ContextClue {
   type: string;
   value: string;
@@ -41,6 +78,7 @@ export interface Snapshot {
   warnings: string[];
   thumbnail_path: string;
   terminal_sessions?: TerminalSession[];
+  browser_sessions?: BrowserSession[];
 }
 
 export interface SnapshotSummary {

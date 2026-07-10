@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
+    "test:companion": "node --test companion-extension/test/capture.test.js companion-extension/test/restore.test.js",
     "tauri": "tauri"
   },
   "dependencies": {

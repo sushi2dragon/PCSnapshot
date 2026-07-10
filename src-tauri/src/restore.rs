@@ -14,7 +14,12 @@ use crate::classify::{self, Category};
 use crate::{RestoreResult, Snapshot, WindowInfo};
 
 #[cfg(windows)]
-pub fn restore_desktop(snapshot: &Snapshot, close_others: bool, ignore_list: &[String]) -> RestoreResult {
+pub fn restore_desktop(
+    snapshot: &Snapshot,
+    close_others: bool,
+    ignore_list: &[String],
+    companion_managed_browsers: bool,
+) -> RestoreResult {
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
@@ -91,7 +96,6 @@ pub fn restore_desktop(snapshot: &Snapshot, close_others: bool, ignore_list: &[S
         let cat = Category::from_str(&proc_.classification);
         // Detect browsers by exe too — a *foreground* browser is classified "foreground".
         let is_browser_proc = cat.is_browser() || classify::classify(&proc_.exe_path, true).is_browser();
-
         // Browsers: reopen the exact tabs captured at snapshot time (the active tab of
         // each window, via `browser_tab` hints) rather than the session-dependent
         // Ctrl+Shift+T trick. All captured URLs open as tabs in one launch. With no
@@ -100,12 +104,16 @@ pub fn restore_desktop(snapshot: &Snapshot, close_others: bool, ignore_list: &[S
             || classify::classify(&proc_.exe_path, true) == Category::Terminal;
 
         let launch_cmd = if is_browser_proc {
-            let urls = browser_urls_for(snapshot, &exe_stem(&proc_.exe_path));
-            if urls.is_empty() {
+            if companion_managed_browsers {
                 String::new()
             } else {
-                let quoted: Vec<String> = urls.iter().map(|u| format!("\"{u}\"")).collect();
-                format!("\"{}\" {}", proc_.exe_path, quoted.join(" "))
+                let urls = browser_urls_for(snapshot, &exe_stem(&proc_.exe_path));
+                if urls.is_empty() {
+                    String::new()
+                } else {
+                    let quoted: Vec<String> = urls.iter().map(|u| format!("\"{u}\"")).collect();
+                    format!("\"{}\" {}", proc_.exe_path, quoted.join(" "))
+                }
             }
         } else if is_terminal_proc {
             terminal_restore_cmd(snapshot, proc_, &mut terminal_index, None)
@@ -329,9 +337,10 @@ pub fn restore_desktop(snapshot: &Snapshot, close_others: bool, ignore_list: &[S
             // restore would be destructive and unreported (`closed_items` is
             // documented as clean-restore-only).
             if close_others {
+                let protected_pids = self_and_ancestor_pids();
                 let mut any_closed = false;
                 for lw in &live_term_wins {
-                    if !claimed_live.contains(&lw.hwnd) {
+                    if !claimed_live.contains(&lw.hwnd) && !protected_pids.contains(&lw.pid) {
                         let hwnd = HWND(lw.hwnd as *mut core::ffi::c_void);
                         let posted = unsafe { PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) };
                         if posted.is_ok() {
@@ -409,7 +418,9 @@ pub fn restore_desktop(snapshot: &Snapshot, close_others: bool, ignore_list: &[S
     // The deadline is generous (capture must be <3s, but restore has no such budget):
     // Electron/JVM apps like Teams and Opera routinely take several seconds to show a
     // window, and a too-short deadline was the main reason so many windows were skipped.
-    let mut pending: Vec<&WindowInfo> = snapshot.windows.iter().collect();
+    let mut pending: Vec<&WindowInfo> = snapshot.windows.iter().filter(|window| {
+        !companion_managed_browsers || !classify::classify(&window.exe_path, true).is_browser()
+    }).collect();
     let mut consumed: HashSet<isize> = HashSet::new();
     let deadline = Instant::now() + Duration::from_millis(8000);
     while !pending.is_empty() && Instant::now() < deadline {
@@ -451,7 +462,11 @@ pub fn restore_desktop(snapshot: &Snapshot, close_others: bool, ignore_list: &[S
     // Terminals closed during reconciliation (clean restore only) are reported too.
     let mut closed_items = term_closed;
     if close_others {
-        let (closed, leftover) = close_windows_not_in_snapshot(snapshot, ignore_list);
+        let (closed, leftover) = close_windows_not_in_snapshot(
+            snapshot,
+            ignore_list,
+            companion_managed_browsers,
+        );
         // Windows that wouldn't close are surfaced honestly as warnings.
         warnings.extend(leftover);
         closed_items.extend(closed);
@@ -616,10 +631,12 @@ fn launch(exe_path: &str, cmd_line: &str, classification: &str) -> Result<(), St
 // ── Live window inspection ────────────────────────────────────────────────────────────
 
 #[cfg(windows)]
+#[derive(Clone)]
 struct LiveWindow {
     hwnd: isize,
     title: String,
     exe: String,
+    pid: u32,
 }
 
 #[cfg(windows)]
@@ -650,6 +667,7 @@ fn live_windows() -> Vec<LiveWindow> {
             hwnd: hwnd.0 as isize,
             title,
             exe: exe_path_for_pid(pid),
+            pid,
         });
         TRUE
     }
@@ -659,6 +677,36 @@ fn live_windows() -> Vec<LiveWindow> {
         let _ = EnumWindows(Some(cb), LPARAM(&mut out as *mut Vec<LiveWindow> as isize));
     }
     out
+}
+
+/// PIDs of this process and every ancestor (parent shell, its terminal, …).
+/// Any window owned by one of these must never be closed during a restore —
+/// otherwise a "close others" restore that omits the launching terminal would
+/// kill the app's own process tree. Best-effort: returns at least our own PID.
+#[cfg(windows)]
+fn self_and_ancestor_pids() -> std::collections::HashSet<u32> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    let mut pids = std::collections::HashSet::new();
+    let me = std::process::id();
+    pids.insert(me);
+
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, ProcessRefreshKind::new());
+
+    // Walk parent links up to the root. Guard against cycles/self-parenting.
+    let mut current = Pid::from_u32(me);
+    for _ in 0..64 {
+        let Some(parent) = sys.process(current).and_then(|p| p.parent()) else {
+            break;
+        };
+        let ppid = parent.as_u32();
+        if !pids.insert(ppid) {
+            break;
+        }
+        current = parent;
+    }
+    pids
 }
 
 /// Best-effort title match: exact first, then either-contains.
@@ -828,19 +876,40 @@ fn focus_window(hwnd_raw: isize) {
 /// `(closed, leftover)`: windows that actually closed, and those that ignored the
 /// request within a short grace period so they can be reported honestly.
 #[cfg(windows)]
-fn close_windows_not_in_snapshot(snapshot: &Snapshot, ignore_list: &[String]) -> (Vec<String>, Vec<String>) {
-    use std::collections::HashSet;
+fn close_windows_not_in_snapshot(
+    snapshot: &Snapshot,
+    ignore_list: &[String],
+    companion_managed_browsers: bool,
+) -> (Vec<String>, Vec<String>) {
+    use std::collections::{HashMap, HashSet};
     use std::time::Duration;
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
 
-    // Apps that belong to the snapshot — these stay open.
+    // Apps that belong to the snapshot — their windows stay open (subject to the
+    // surplus rule below).
     let keep: HashSet<String> = snapshot
         .processes
         .iter()
         .filter(|p| !p.exe_path.is_empty())
         .map(|p| exe_stem(&p.exe_path))
         .collect();
+
+    // How many windows each in-snapshot app had, with their titles — used to
+    // close *surplus* windows of an app that is in the snapshot but now has more
+    // windows open than were captured (e.g. a browser: 1 window captured, 3 open
+    // now → close the 2 extras). Without this, closing was exe-level: any app in
+    // the snapshot kept ALL its windows no matter how many were opened after.
+    let mut snap_titles_by_exe: HashMap<String, Vec<String>> = HashMap::new();
+    for w in &snapshot.windows {
+        if w.exe_path.is_empty() {
+            continue;
+        }
+        snap_titles_by_exe
+            .entry(exe_stem(&w.exe_path))
+            .or_default()
+            .push(w.title.clone());
+    }
 
     // System-critical processes + user-ignored processes + this app's own window.
     let mut protected: HashSet<String> = crate::config::SYSTEM_PROTECTED
@@ -854,13 +923,57 @@ fn close_windows_not_in_snapshot(snapshot: &Snapshot, ignore_list: &[String]) ->
         protected.insert(exe_stem(&me.to_string_lossy()));
     }
 
-    let targets: Vec<LiveWindow> = live_windows()
-        .into_iter()
+    // Never close our own window tree (this app, its launching shell/terminal).
+    let protected_pids = self_and_ancestor_pids();
+
+    let live = live_windows();
+
+    // Set A: windows whose exe is not part of the snapshot at all.
+    let mut targets: Vec<LiveWindow> = live
+        .iter()
         .filter(|w| {
             let stem = exe_stem(&w.exe);
-            !w.exe.is_empty() && !keep.contains(&stem) && !protected.contains(&stem)
+            !w.exe.is_empty()
+                && !keep.contains(&stem)
+                && !(companion_managed_browsers && classify::classify(&w.exe, true).is_browser())
+                && !protected.contains(&stem)
+                && !protected_pids.contains(&w.pid)
         })
+        .cloned()
         .collect();
+
+    // Set B: surplus windows of an app that IS in the snapshot. Keep the windows
+    // that best match the saved titles; close the rest.
+    for (stem, snap_titles) in &snap_titles_by_exe {
+        if snap_titles.is_empty() || protected.contains(stem) {
+            continue;
+        }
+        // Terminals are reconciled/closed by the dedicated terminal pass earlier
+        // in the restore; leave them to it so the two passes can't double-close
+        // or double-report the same window.
+        if classify::classify(stem, true) == Category::Terminal {
+            continue;
+        }
+        if companion_managed_browsers && classify::classify(stem, true).is_browser() {
+            continue;
+        }
+        let live_of: Vec<&LiveWindow> = live
+            .iter()
+            .filter(|w| {
+                !w.exe.is_empty()
+                    && exe_stem(&w.exe) == *stem
+                    && !protected_pids.contains(&w.pid)
+            })
+            .collect();
+        let live_titles: Vec<String> = live_of.iter().map(|w| w.title.clone()).collect();
+        for idx in surplus_close_indices(snap_titles, &live_titles) {
+            targets.push(live_of[idx].clone());
+        }
+    }
+
+    // A window could qualify for both sets in odd cases; close each at most once.
+    targets.sort_by_key(|w| w.hwnd);
+    targets.dedup_by_key(|w| w.hwnd);
 
     if targets.is_empty() {
         return (vec![], vec![]);
@@ -895,6 +1008,39 @@ fn close_windows_not_in_snapshot(snapshot: &Snapshot, ignore_list: &[String]) ->
         }
     }
     (closed, leftover)
+}
+
+/// Which live windows of an in-snapshot app to close as surplus. Keeps
+/// `snap_titles.len()` windows, preferring ones whose title matches a saved
+/// title; returns indices (into `live_titles`) of the windows to close. Empty
+/// when the app has no more windows open than were captured.
+#[cfg(windows)]
+fn surplus_close_indices(snap_titles: &[String], live_titles: &[String]) -> Vec<usize> {
+    let snap_count = snap_titles.len();
+    if snap_count == 0 || live_titles.len() <= snap_count {
+        return vec![];
+    }
+    // Matched windows sort first (kept); unmatched last (closed). Stable sort
+    // keeps the surplus deterministic.
+    let mut order: Vec<usize> = (0..live_titles.len()).collect();
+    order.sort_by_key(|&i| if title_matches_any(&live_titles[i], snap_titles) { 0 } else { 1 });
+    order.into_iter().skip(snap_count).collect()
+}
+
+/// Whether a live window title matches any saved title — exact, or a substring
+/// match of ≥4 chars (same rule the reposition/terminal passes use). Used to
+/// decide which windows of an over-populated app to keep vs close.
+#[cfg(windows)]
+fn title_matches_any(title: &str, snap_titles: &[String]) -> bool {
+    if title.is_empty() {
+        return false;
+    }
+    snap_titles.iter().any(|s| {
+        s == title
+            || (s.len() >= 4
+                && title.len() >= 4
+                && (s.contains(title) || title.contains(s.as_str())))
+    })
 }
 
 /// Build a restore-aware launch command for a terminal process by matching it
@@ -981,10 +1127,58 @@ fn browser_urls_for(snapshot: &Snapshot, stem: &str) -> Vec<String> {
     urls
 }
 
+#[cfg(all(windows, test))]
+mod tests {
+    use super::surplus_close_indices;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_surplus_when_live_not_over_snapshot() {
+        assert!(surplus_close_indices(&v(&["A"]), &v(&["A"])).is_empty());
+        assert!(surplus_close_indices(&v(&["A", "B"]), &v(&["X"])).is_empty());
+        // No saved windows for this app → nothing to close via the surplus rule.
+        assert!(surplus_close_indices(&v(&[]), &v(&["A", "B"])).is_empty());
+    }
+
+    #[test]
+    fn closes_unmatched_extras_keeps_the_match() {
+        // The user's case: 1 window captured ("Gmail"), 3 open now. Keep the one
+        // matching the saved title, close the two opened afterward.
+        let snap = v(&["Gmail — Inbox"]);
+        let live = v(&["Gmail — Inbox", "New Tab", "Docs"]);
+        let mut closed = surplus_close_indices(&snap, &live);
+        closed.sort();
+        assert_eq!(closed, vec![1, 2]); // indices of "New Tab" and "Docs"
+    }
+
+    #[test]
+    fn keeps_snap_count_even_when_none_match() {
+        // Titles all changed since capture: still close down to snap_count,
+        // keeping an arbitrary-but-bounded one.
+        let closed = surplus_close_indices(&v(&["old"]), &v(&["a", "b", "c"]));
+        assert_eq!(closed.len(), 2);
+    }
+
+    #[test]
+    fn two_captured_windows_close_one_of_three() {
+        let snap = v(&["Win A", "Win B"]);
+        let live = v(&["Win A", "Win B", "Extra"]);
+        assert_eq!(surplus_close_indices(&snap, &live), vec![2]);
+    }
+}
+
 // ── Non-Windows fallback ──────────────────────────────────────────────────────────────
 
 #[cfg(not(windows))]
-pub fn restore_desktop(_snapshot: &Snapshot, _close_others: bool, _ignore_list: &[String]) -> RestoreResult {
+pub fn restore_desktop(
+    _snapshot: &Snapshot,
+    _close_others: bool,
+    _ignore_list: &[String],
+    _companion_managed_browsers: bool,
+) -> RestoreResult {
     RestoreResult {
         success: false,
         message: "Restore engine is only implemented on Windows".to_string(),
