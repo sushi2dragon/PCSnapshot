@@ -104,3 +104,14 @@ export interface RestoreResult {
   /** Windows closed because they were not part of the snapshot (clean restore only). */
   closed_items: string[];
 }
+
+export interface ActivityEvent {
+  id: string; timestamp: string; kind: string; snapshot_name: string | null;
+  status: "success" | "warning" | "failed"; summary: string; detail_lines: string[];
+}
+export interface CloseResult { closed: string[]; refused: string[] }
+
+export interface ActiveSession {
+  id: string;
+  timestamp: string;
+}

@@ -1,14 +1,16 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { useSnapshots } from "./hooks/useSnapshots";
-import { EmptyState } from "./components/EmptyState";
-import { SnapshotGrid } from "./components/SnapshotGrid";
+import { MissionControl, StartNewModal } from "./components/MissionControl";
 import { NamePromptModal } from "./components/NamePromptModal";
 import { Toast } from "./components/Toast";
 import { RestoreReportModal } from "./components/RestoreReportModal";
 import { RestoreConfirmModal } from "./components/RestoreConfirmModal";
 import { IgnoreListModal } from "./components/IgnoreListModal";
 import { RecaptureConfirmModal } from "./components/RecaptureConfirmModal";
-import { isCurrentStateSaved, clearAllSnapshots } from "./commands/snapshots";
+import { DeleteConfirmModal } from "./components/DeleteConfirmModal";
+import { isCurrentStateSaved, clearAllSnapshots, closeAllWindows } from "./commands/snapshots";
+import { useActivity } from "./hooks/useActivity";
+import { useActiveSession } from "./hooks/useActiveSession";
 import { terminalHookStatus, setTerminalHook } from "./commands/config";
 import type { RestoreResult } from "./types/snapshot";
 
@@ -24,7 +26,14 @@ function App() {
   const [saveFirstPendingId, setSaveFirstPendingId] = useState<string | null>(null);
   const [showIgnoreList, setShowIgnoreList] = useState(false);
   const [confirmRecapture, setConfirmRecapture] = useState<{ id: string; name: string } | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<{ id: string; name: string } | null>(null);
   const [terminalHookEnabled, setTerminalHookEnabled] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [startNewOpen, setStartNewOpen] = useState(false);
+  const [startNewBusy, setStartNewBusy] = useState(false);
+  const [startNewAfterCapture, setStartNewAfterCapture] = useState(false);
+  const { events, refresh: refreshActivity } = useActivity();
+  const { activeId, refresh: refreshActive } = useActiveSession();
 
   useEffect(() => {
     terminalHookStatus().then(setTerminalHookEnabled).catch(() => {});
@@ -46,6 +55,18 @@ function App() {
       setModalOpen(false);
       try {
         const warnings = await capture(name);
+        await refreshActivity();
+
+        if (startNewAfterCapture) {
+          setStartNewAfterCapture(false);
+          setStartNewBusy(true);
+          const result = await closeAllWindows();
+          await refreshActivity();
+          refreshActive();
+          setStartNewBusy(false);
+          setToast({ message: `Started fresh · ${result.closed.length} windows closed`, type: result.refused.length ? "warning" : "success" });
+          return;
+        }
 
         // "Save current first" flow: after capturing the live desktop, return to the
         // restore confirmation for the snapshot the user originally picked.
@@ -68,7 +89,7 @@ function App() {
         setToast({ message: `Capture failed: ${e}`, type: "warning" });
       }
     },
-    [capture, saveFirstPendingId, snapshots]
+    [capture, saveFirstPendingId, snapshots, startNewAfterCapture, refreshActivity]
   );
 
   // Guards the async "is current state saved?" check: only the latest request may
@@ -103,6 +124,8 @@ function App() {
       setConfirmRestore(null);
       try {
         const result = await restore(id, closeOthers);
+        await refreshActivity();
+        refreshActive();
         const hasDetail =
           result.failed_items.length > 0 ||
           result.warnings.length > 0 ||
@@ -116,7 +139,7 @@ function App() {
         setToast({ message: `Restore failed: ${e}`, type: "warning" });
       }
     },
-    [confirmRestore, restore]
+    [confirmRestore, restore, refreshActivity]
   );
 
   // "Save current first": stash the target, then open the capture name prompt.
@@ -141,6 +164,7 @@ function App() {
     setConfirmRecapture(null);
     try {
       const warnings = await recapture(id);
+      await refreshActivity();
       setToast(
         warnings.length > 0
           ? { message: `Snapshot updated with ${warnings.length} warning(s)`, type: "warning" }
@@ -149,24 +173,52 @@ function App() {
     } catch (e) {
       setToast({ message: `Recapture failed: ${e}`, type: "warning" });
     }
-  }, [confirmRecapture, recapture]);
+  }, [confirmRecapture, recapture, refreshActivity]);
 
+  // Step 1: clicking delete (tile ×, details trash, or the Delete key) opens the
+  // confirmation instead of removing immediately — deletion is irreversible.
   const handleDelete = useCallback(
-    async (id: string) => {
-      try {
-        await remove(id);
-        setToast({ message: "Snapshot deleted", type: "success" });
-      } catch (e) {
-        setToast({ message: `Delete failed: ${e}`, type: "warning" });
-      }
+    (id: string) => {
+      const snap = snapshots.find((s) => s.id === id);
+      setConfirmDelete({ id, name: snap?.name ?? "snapshot" });
     },
-    [remove]
+    [snapshots]
   );
+
+  // Step 2: user confirmed — actually remove it.
+  const handleConfirmDelete = useCallback(async () => {
+    if (!confirmDelete) return;
+    const id = confirmDelete.id;
+    setConfirmDelete(null);
+    try {
+      await remove(id);
+      await refreshActivity();
+      refreshActive();
+      if (selectedId === id) setSelectedId(null);
+      setToast({ message: "Snapshot deleted", type: "success" });
+    } catch (e) {
+      setToast({ message: `Delete failed: ${e}`, type: "warning" });
+    }
+  }, [confirmDelete, remove, selectedId, refreshActivity]);
+
+  const handleStartNew = useCallback(async (saveFirst: boolean) => {
+    setStartNewOpen(false);
+    if (saveFirst) { setStartNewAfterCapture(true); setModalOpen(true); return; }
+    setStartNewBusy(true);
+    try {
+      const result = await closeAllWindows();
+      await refreshActivity();
+      refreshActive();
+      setToast({ message: `Started fresh · ${result.closed.length} windows closed`, type: result.refused.length ? "warning" : "success" });
+    } catch (e) { setToast({ message: `Start new failed: ${e}`, type: "warning" }); }
+    finally { setStartNewBusy(false); }
+  }, [refreshActivity]);
 
   const handleClearAll = useCallback(async () => {
     try {
       await clearAllSnapshots();
       await refresh();
+      refreshActive();
       setToast({ message: "All snapshots deleted", type: "success" });
     } catch (e) {
       setToast({ message: `Clear all failed: ${e}`, type: "warning" });
@@ -210,28 +262,17 @@ function App() {
   }
 
   return (
-    <div className="min-h-screen" style={{ backgroundColor: "var(--bg-base)" }}>
-      {snapshots.length === 0 ? (
-        <EmptyState onTakeSnapshot={handleTakeSnapshot} />
-      ) : (
-        <SnapshotGrid
-          snapshots={snapshots}
-          onRestore={handleRestore}
-          onDelete={handleDelete}
-          onRecapture={handleRecapture}
-          onTakeSnapshot={handleTakeSnapshot}
-          onClearAll={handleClearAll}
-          onImport={handleImport}
-          onHelp={handleHelp}
-          onRefresh={handleRefresh}
-          onIgnoreList={() => setShowIgnoreList(true)}
-          onToggleTerminalHook={handleToggleTerminalHook}
-          terminalHookEnabled={terminalHookEnabled}
-        />
-      )}
+    <div style={{ height: "100vh", backgroundColor: "var(--bg-base)" }}>
+      <MissionControl snapshots={snapshots} events={events} selectedId={selectedId} onSelect={setSelectedId}
+        activeSessionId={activeId}
+        onCapture={handleTakeSnapshot} onStartNew={() => setStartNewOpen(true)} onRestore={handleRestore}
+        onDelete={handleDelete} onRecapture={handleRecapture} onClearAll={handleClearAll} onImport={handleImport}
+        onHelp={handleHelp} onRefresh={handleRefresh} onIgnoreList={() => setShowIgnoreList(true)}
+        onToggleTerminalHook={handleToggleTerminalHook} terminalHookEnabled={terminalHookEnabled}/>
+      <StartNewModal open={startNewOpen} busy={startNewBusy} onCancel={() => setStartNewOpen(false)} onConfirm={handleStartNew}/>
 
       <NamePromptModal
-        key={modalOpen ? "open" : "closed"}
+        key={modalOpen ? "capture-open" : "capture-closed"}
         isOpen={modalOpen}
         defaultName={defaultName}
         onConfirm={handleConfirmCapture}
@@ -242,7 +283,7 @@ function App() {
       />
 
       <RestoreConfirmModal
-        key={confirmRestore?.id ?? "closed"}
+        key={confirmRestore?.id ? `restore-${confirmRestore.id}` : "restore-closed"}
         snapshotName={confirmRestore?.name ?? null}
         currentStateSaved={currentStateSaved}
         onConfirm={handleConfirmRestore}
@@ -267,8 +308,14 @@ function App() {
         onCancel={() => setConfirmRecapture(null)}
       />
 
+      <DeleteConfirmModal
+        snapshotName={confirmDelete?.name ?? null}
+        onConfirm={handleConfirmDelete}
+        onCancel={() => setConfirmDelete(null)}
+      />
+
       <IgnoreListModal
-        key={showIgnoreList ? "open" : "closed"}
+        key={showIgnoreList ? "ignore-open" : "ignore-closed"}
         isOpen={showIgnoreList}
         onClose={() => setShowIgnoreList(false)}
       />

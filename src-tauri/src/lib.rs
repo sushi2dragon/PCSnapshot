@@ -3,14 +3,18 @@ use std::path::PathBuf;
 use tauri::Manager;
 
 mod browser;
+mod activity;
+mod active_session;
 pub mod browser_bridge;
 mod capture;
 mod classify;
 pub(crate) mod config;
 mod context;
+mod icons;
 mod restore;
 mod terminal;
 mod terminal_hook;
+mod vscode;
 
 /// Split a shell-style command string into tokens, respecting double-quoted segments.
 /// Used by capture (to build quoted cmd_lines) and restore (to parse them back).
@@ -38,7 +42,7 @@ pub(crate) fn tokenize(cmd: &str) -> Vec<String> {
 // ── Schema version ──────────────────────────────────────────────────────────
 
 const SCHEMA_VERSION: u32 = 3;
-const THUMBNAIL_WIDTH:  u32 = 480;
+const THUMBNAIL_WIDTH: u32 = 480;
 const THUMBNAIL_HEIGHT: u32 = 270;
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -218,6 +222,9 @@ pub struct RestoreResult {
     pub closed_items: Vec<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct CloseResult { pub closed: Vec<String>, pub refused: Vec<String> }
+
 // ── Storage helpers ──────────────────────────────────────────────────────────
 
 /// Returns the snapshots directory, creating it if it does not exist.
@@ -227,8 +234,7 @@ fn snapshots_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|e| format!("Cannot resolve app data dir: {e}"))?;
     let dir = base.join("Snapshots");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("Cannot create snapshots dir: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create snapshots dir: {e}"))?;
     Ok(dir)
 }
 
@@ -267,9 +273,7 @@ fn next_auto_number(dir: &PathBuf) -> usize {
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.path().extension().and_then(|ext| ext.to_str()) == Some("json")
-                })
+                .filter(|e| e.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
                 .filter_map(|e| try_load_snapshot(&e.path()))
                 .filter_map(|s| {
                     s.name
@@ -285,13 +289,17 @@ fn next_auto_number(dir: &PathBuf) -> usize {
 
 /// Captures the primary monitor, resizes to thumbnail dimensions, and saves as PNG.
 /// Returns Err on any failure — caller must treat this as a non-fatal warning.
+/// Callers exclude their own window from the shot via `set_capture_exclusion`
+/// before spawning this, so nothing here needs to know about window state.
 fn capture_thumbnail(png_path: &PathBuf) -> Result<(), String> {
     use image::imageops::FilterType;
 
-    let monitors = xcap::Monitor::all()
-        .map_err(|e| format!("Could not enumerate monitors: {e}"))?;
+    let monitors =
+        xcap::Monitor::all().map_err(|e| format!("Could not enumerate monitors: {e}"))?;
 
-    let monitor = monitors.into_iter().next()
+    let monitor = monitors
+        .into_iter()
+        .next()
         .ok_or_else(|| "No monitors found".to_string())?;
 
     let rgba_image = monitor
@@ -305,10 +313,67 @@ fn capture_thumbnail(png_path: &PathBuf) -> Result<(), String> {
         FilterType::Lanczos3,
     );
 
-    thumbnail.save(png_path)
+    thumbnail
+        .save(png_path)
         .map_err(|e| format!("Failed to save thumbnail PNG: {e}"))?;
 
     Ok(())
+}
+
+/// Toggle screen-capture exclusion for our own window (Windows 10 2004+).
+///
+/// With `exclude` true the window stays fully visible to the user but is omitted
+/// from screen captures — BitBlt, PrintWindow, and the modern capture APIs — at
+/// the DWM compositor level, so it never lands in the snapshot thumbnail (xcap
+/// grabs the monitor via a desktop-DC `BitBlt`, which this suppresses). Unlike
+/// hiding the window this doesn't flicker, steal focus, or depend on the UI
+/// thread pumping a `ShowWindow` message before the shot fires. Any failure
+/// (older Windows where the flag is unsupported, or an unavailable handle) is a
+/// silent no-op — the thumbnail just includes the window as it did before.
+#[cfg(windows)]
+fn set_capture_exclusion(window: &tauri::WebviewWindow, exclude: bool) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::DwmFlush;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
+    };
+
+    let Ok(handle) = window.hwnd() else { return };
+    // Reconstruct the HWND from the raw pointer so we don't depend on Tauri's
+    // bundled `windows` crate being the same version as ours.
+    let hwnd = HWND(handle.0 as isize as *mut core::ffi::c_void);
+    let affinity = if exclude { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
+    unsafe {
+        let _ = SetWindowDisplayAffinity(hwnd, affinity);
+        // Block until DWM composes a frame reflecting the new affinity, so a
+        // capture kicked off right after this call already sees us excluded.
+        if exclude {
+            let _ = DwmFlush();
+        }
+    }
+}
+
+/// RAII guard that turns capture exclusion off when it drops, so the window is
+/// never left permanently hidden from captures even if the surrounding command
+/// bails out early via `?`.
+#[cfg(windows)]
+struct CaptureExclusion<'a> {
+    window: &'a tauri::WebviewWindow,
+}
+
+#[cfg(windows)]
+impl<'a> CaptureExclusion<'a> {
+    fn new(window: &'a tauri::WebviewWindow) -> Self {
+        set_capture_exclusion(window, true);
+        Self { window }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CaptureExclusion<'_> {
+    fn drop(&mut self) {
+        set_capture_exclusion(self.window, false);
+    }
 }
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
@@ -332,6 +397,14 @@ async fn take_snapshot(
     let timestamp = chrono::Utc::now().to_rfc3339();
     let thumbnail_path_buf = png_path(&dir, &id);
 
+    // Exclude our own window from the screen capture so it never appears in the
+    // thumbnail. This keeps the window visible on screen (no flicker, no focus
+    // theft) but omits it from the shot at the compositor level. The guard clears
+    // the exclusion when this command returns, including on early error paths.
+    let main_window = app.get_webview_window("main");
+    #[cfg(windows)]
+    let _capture_exclusion = main_window.as_ref().map(CaptureExclusion::new);
+
     // Run the (slow) screenshot on a separate thread so it overlaps window/process
     // enumeration. Total capture time ≈ max(screenshot, enumeration), not the sum.
     let thumb_path = thumbnail_path_buf.clone();
@@ -349,7 +422,9 @@ async fn take_snapshot(
     let captured = capture::capture_desktop(&cfg.ignore_list);
     let mut warnings: Vec<String> = captured.warnings;
 
-    let browser_reply = browser_capture.await.map_err(|e| format!("Browser bridge task failed: {e}"))?;
+    let browser_reply = browser_capture
+        .await
+        .map_err(|e| format!("Browser bridge task failed: {e}"))?;
     let has_browser = captured.processes.iter().any(|process| {
         !process.exe_path.is_empty() && classify::classify(&process.exe_path, true).is_browser()
     });
@@ -378,12 +453,14 @@ async fn take_snapshot(
         browser_sessions: browser_reply.sessions,
     };
 
-    let json = serde_json::to_string_pretty(&snapshot)
-        .map_err(|e| format!("Serialise error: {e}"))?;
-    std::fs::write(json_path(&dir, &id), json)
-        .map_err(|e| format!("Write error: {e}"))?;
+    let json =
+        serde_json::to_string_pretty(&snapshot).map_err(|e| format!("Serialise error: {e}"))?;
+    std::fs::write(json_path(&dir, &id), json).map_err(|e| format!("Write error: {e}"))?;
 
     let summary = snapshot_to_summary(&snapshot);
+    activity::append(&app, activity::event("capture", Some(snapshot.name.clone()),
+        if warnings.is_empty() { "success" } else { "warning" },
+        format!("Snapshot captured · {} apps", snapshot.processes.len()), warnings.clone()));
     Ok(CaptureResult {
         snapshot: summary,
         warnings,
@@ -405,6 +482,12 @@ async fn recapture_snapshot(
     let timestamp = chrono::Utc::now().to_rfc3339();
     let thumbnail_path_buf = png_path(&dir, &id);
 
+    // Exclude our own window from the shot (see `take_snapshot` for details); the
+    // guard clears the exclusion when this command returns.
+    let main_window = app.get_webview_window("main");
+    #[cfg(windows)]
+    let _capture_exclusion = main_window.as_ref().map(CaptureExclusion::new);
+
     // Screenshot on a separate thread, overlapping window enumeration.
     let thumb_tmp = dir.join(format!("{id}_tmp.png"));
     let thumb_tmp2 = thumb_tmp.clone();
@@ -419,7 +502,9 @@ async fn recapture_snapshot(
     let captured = capture::capture_desktop(&cfg.ignore_list);
     let mut warnings: Vec<String> = captured.warnings;
 
-    let browser_reply = browser_capture.await.map_err(|e| format!("Browser bridge task failed: {e}"))?;
+    let browser_reply = browser_capture
+        .await
+        .map_err(|e| format!("Browser bridge task failed: {e}"))?;
     let has_browser = captured.processes.iter().any(|process| {
         !process.exe_path.is_empty() && classify::classify(&process.exe_path, true).is_browser()
     });
@@ -456,12 +541,10 @@ async fn recapture_snapshot(
 
     // Write to temp file first, then rename — if capture fails the original is untouched.
     let tmp_json = dir.join(format!("{id}_tmp.json"));
-    let json = serde_json::to_string_pretty(&snapshot)
-        .map_err(|e| format!("Serialise error: {e}"))?;
-    std::fs::write(&tmp_json, json)
-        .map_err(|e| format!("Write error: {e}"))?;
-    std::fs::rename(&tmp_json, &existing_path)
-        .map_err(|e| format!("Rename error: {e}"))?;
+    let json =
+        serde_json::to_string_pretty(&snapshot).map_err(|e| format!("Serialise error: {e}"))?;
+    std::fs::write(&tmp_json, json).map_err(|e| format!("Write error: {e}"))?;
+    std::fs::rename(&tmp_json, &existing_path).map_err(|e| format!("Rename error: {e}"))?;
 
     // Move temp thumbnail over the original only when capture fully succeeded —
     // a partially-written PNG must never replace a good thumbnail. On failure,
@@ -473,6 +556,9 @@ async fn recapture_snapshot(
     }
 
     let summary = snapshot_to_summary(&snapshot);
+    activity::append(&app, activity::event("recapture", Some(snapshot.name.clone()),
+        if warnings.is_empty() { "success" } else { "warning" },
+        format!("Snapshot updated · {} apps", snapshot.processes.len()), warnings.clone()));
     Ok(CaptureResult {
         snapshot: summary,
         warnings,
@@ -483,8 +569,7 @@ async fn recapture_snapshot(
 async fn list_snapshots(app: tauri::AppHandle) -> Result<Vec<SnapshotSummary>, String> {
     let dir = snapshots_dir(&app)?;
 
-    let entries = std::fs::read_dir(&dir)
-        .map_err(|e| format!("Read dir error: {e}"))?;
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("Read dir error: {e}"))?;
 
     let mut summaries: Vec<SnapshotSummary> = entries
         .filter_map(|entry| {
@@ -501,6 +586,24 @@ async fn list_snapshots(app: tauri::AppHandle) -> Result<Vec<SnapshotSummary>, S
     // Newest first
     summaries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     Ok(summaries)
+}
+
+#[tauri::command]
+async fn get_snapshot(app: tauri::AppHandle, id: String) -> Result<Snapshot, String> {
+    let dir = snapshots_dir(&app)?;
+    try_load_snapshot(&json_path(&dir, &id)).ok_or_else(|| format!("Snapshot {id} not found or unreadable"))
+}
+
+#[tauri::command]
+async fn close_all_windows(app: tauri::AppHandle) -> Result<CloseResult, String> {
+    let ignored = config::load_config(&app).ignore_list;
+    let (closed, refused) = tauri::async_runtime::spawn_blocking(move || restore::close_all_windows(&ignored))
+        .await.map_err(|e| format!("Close task failed: {e}"))?;
+    let status = if refused.is_empty() { "success" } else { "warning" };
+    activity::append(&app, activity::event("start_new", None, status,
+        format!("Started fresh · {} windows closed", closed.len()), refused.clone()));
+    active_session::clear(&app);
+    Ok(CloseResult { closed, refused })
 }
 
 #[tauri::command]
@@ -524,26 +627,31 @@ async fn restore_snapshot(
     let cfg = config::load_config(&app);
     let ignore_list = cfg.ignore_list;
     let sessions = snapshot.browser_sessions.clone();
+    let snapshot_name = snapshot.name.clone();
     let has_browser_sessions = !sessions.is_empty();
 
-    let mut result =
-        tauri::async_runtime::spawn_blocking(move || {
-            restore::restore_desktop(
-                &snapshot,
-                close_others,
-                &ignore_list,
-                has_browser_sessions,
-            )
-        })
-            .await
-            .map_err(|e| format!("Restore task failed: {e}"))?;
+    let mut result = tauri::async_runtime::spawn_blocking(move || {
+        restore::restore_desktop(&snapshot, close_others, &ignore_list, has_browser_sessions)
+    })
+    .await
+    .map_err(|e| format!("Restore task failed: {e}"))?;
 
     if has_browser_sessions {
-        let reply = browser_bridge.inner().clone().restore(&sessions, close_others).await;
+        let reply = browser_bridge
+            .inner()
+            .clone()
+            .restore(&sessions, close_others)
+            .await;
         result.closed_items.extend(reply.closed_items);
         result.warnings.extend(reply.warnings);
     }
 
+    let mut details = result.failed_items.clone();
+    details.extend(result.warnings.clone());
+    activity::append(&app, activity::event("restore", Some(snapshot_name),
+        if !result.failed_items.is_empty() { "failed" } else if !result.warnings.is_empty() { "warning" } else { "success" },
+        result.message.clone(), details));
+    active_session::set(&app, &id);
     Ok(result)
 }
 
@@ -594,24 +702,24 @@ async fn is_current_state_saved(app: tauri::AppHandle) -> Result<bool, String> {
 }
 
 #[tauri::command]
-async fn delete_snapshot(
-    app: tauri::AppHandle,
-    id: String,
-) -> Result<(), String> {
+async fn delete_snapshot(app: tauri::AppHandle, id: String) -> Result<(), String> {
     let dir = snapshots_dir(&app)?;
+    let deleted_name = try_load_snapshot(&json_path(&dir, &id)).map(|s| s.name);
 
     let json = json_path(&dir, &id);
     if json.exists() {
-        std::fs::remove_file(&json)
-            .map_err(|e| format!("Delete JSON error: {e}"))?;
+        std::fs::remove_file(&json).map_err(|e| format!("Delete JSON error: {e}"))?;
     }
 
     let png = png_path(&dir, &id);
     if png.exists() {
-        std::fs::remove_file(&png)
-            .map_err(|e| format!("Delete PNG error: {e}"))?;
+        std::fs::remove_file(&png).map_err(|e| format!("Delete PNG error: {e}"))?;
     }
 
+    activity::append(&app, activity::event("delete", deleted_name, "success", "Snapshot deleted".into(), vec![]));
+    if active_session::current_id(&app).as_deref() == Some(id.as_str()) {
+        active_session::clear(&app);
+    }
     Ok(())
 }
 
@@ -619,8 +727,7 @@ async fn delete_snapshot(
 async fn clear_all_snapshots(app: tauri::AppHandle) -> Result<(), String> {
     let dir = snapshots_dir(&app)?;
 
-    let entries = std::fs::read_dir(&dir)
-        .map_err(|e| format!("Read dir error: {e}"))?;
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("Read dir error: {e}"))?;
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -631,6 +738,7 @@ async fn clear_all_snapshots(app: tauri::AppHandle) -> Result<(), String> {
         }
     }
 
+    active_session::clear(&app);
     Ok(())
 }
 
@@ -648,7 +756,9 @@ async fn add_to_ignore_list(app: tauri::AppHandle, exe_name: String) -> Result<(
         return Err("Empty process name".to_string());
     }
     if config::SYSTEM_PROTECTED.contains(&stem.as_str()) {
-        return Err(format!("{stem} is a system-critical process and is always protected"));
+        return Err(format!(
+            "{stem} is a system-critical process and is always protected"
+        ));
     }
     let mut cfg = config::load_config(&app);
     if !cfg.ignore_list.contains(&stem) {
@@ -683,10 +793,16 @@ async fn get_running_processes(app: tauri::AppHandle) -> Result<Vec<String>, Str
         .values()
         .filter_map(|p| {
             let exe = p.exe()?.to_string_lossy().to_string();
-            if exe.is_empty() { return None; }
+            if exe.is_empty() {
+                return None;
+            }
             let stem = config::normalize_exe_name(&exe);
-            if stem.is_empty() { return None; }
-            if config::is_ignored(&stem, &cfg.ignore_list) { return None; }
+            if stem.is_empty() {
+                return None;
+            }
+            if config::is_ignored(&stem, &cfg.ignore_list) {
+                return None;
+            }
             Some(stem)
         })
         .collect();
@@ -712,6 +828,13 @@ async fn set_terminal_hook(enabled: bool) -> Result<String, String> {
     }
 }
 
+/// The captured app's own icon as a PNG `data:` URI, or `None` if it can't be
+/// read (the details pane falls back to a monogram). Extracted lazily per row.
+#[tauri::command]
+fn get_app_icon(exe_path: String) -> Option<String> {
+    icons::extract_icon_data_uri(&exe_path)
+}
+
 // ── App entry point ───────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -723,6 +846,9 @@ pub fn run() {
             take_snapshot,
             recapture_snapshot,
             list_snapshots,
+            get_snapshot,
+            close_all_windows,
+            activity::list_activity,
             restore_snapshot,
             delete_snapshot,
             clear_all_snapshots,
@@ -733,6 +859,8 @@ pub fn run() {
             get_running_processes,
             terminal_hook_status,
             set_terminal_hook,
+            get_app_icon,
+            active_session::get_active_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -744,7 +872,8 @@ mod snapshot_schema_tests {
 
     #[test]
     fn v2_snapshot_without_browser_sessions_remains_readable() {
-        let snapshot: Snapshot = serde_json::from_str(r#"{
+        let snapshot: Snapshot = serde_json::from_str(
+            r#"{
             "schema_version": 2,
             "id": "snap_1",
             "name": "Old",
@@ -755,14 +884,17 @@ mod snapshot_schema_tests {
             "restore_hints": [],
             "warnings": [],
             "thumbnail_path": "C:/snapshot.png"
-        }"#).expect("v2 snapshots must remain readable");
+        }"#,
+        )
+        .expect("v2 snapshots must remain readable");
 
         assert!(snapshot.browser_sessions.is_empty());
     }
 
     #[test]
     fn malformed_optional_browser_payload_does_not_corrupt_snapshot() {
-        let snapshot: Snapshot = serde_json::from_str(r#"{
+        let snapshot: Snapshot = serde_json::from_str(
+            r#"{
             "schema_version": 3,
             "id": "snap_2",
             "name": "Partial",
@@ -774,7 +906,9 @@ mod snapshot_schema_tests {
             "warnings": [],
             "thumbnail_path": "C:/snapshot.png",
             "browser_sessions": "not-an-array"
-        }"#).expect("browser context must not invalidate the desktop snapshot");
+        }"#,
+        )
+        .expect("browser context must not invalidate the desktop snapshot");
 
         assert!(snapshot.browser_sessions.is_empty());
     }
