@@ -87,14 +87,28 @@ impl BrowserBridge {
     /// or broken extension becomes a warning; it never blocks desktop capture.
     pub async fn capture(&self, deadline: Duration) -> CaptureReply {
         let request_id = self.next_request_id();
-        let targets: Vec<(String, mpsc::UnboundedSender<Value>)> = self
-            .inner
-            .sessions
-            .lock()
-            .expect("browser bridge sessions lock poisoned")
-            .iter()
-            .map(|(profile, session)| (profile.clone(), session.tx.clone()))
-            .collect();
+
+        // A capture fired moments after the desktop app opens races the companion's
+        // reconnect: the browser-owned native host reattaches to this pipe within
+        // ~1s of the pipe appearing, but the very first capture can arrive before it
+        // has. Give a brief grace for at least one profile to register before giving
+        // up, so the common "open the app, snapshot right away" path stops spuriously
+        // reporting the browser as disconnected. No wait once anything is connected.
+        let connect_grace = tokio::time::Instant::now() + Duration::from_millis(1500);
+        let targets: Vec<(String, mpsc::UnboundedSender<Value>)> = loop {
+            let current: Vec<(String, mpsc::UnboundedSender<Value>)> = self
+                .inner
+                .sessions
+                .lock()
+                .expect("browser bridge sessions lock poisoned")
+                .iter()
+                .map(|(profile, session)| (profile.clone(), session.tx.clone()))
+                .collect();
+            if !current.is_empty() || tokio::time::Instant::now() >= connect_grace {
+                break current;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        };
 
         if targets.is_empty() {
             return CaptureReply {
@@ -180,7 +194,12 @@ impl BrowserBridge {
         deadline: Duration,
     ) -> Result<BrowserRestoreReport, String> {
         let profile = &target.browser.profile_instance_id;
-        let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        // Restore may have just cold-launched this browser: a fresh Chromium start
+        // plus MV3 service-worker init plus the native-messaging handshake routinely
+        // takes well over 5s, which made cold restores falsely report the companion
+        // as "not connected" and skip tab reconciliation. Wait long enough to cover a
+        // cold start; the full deadline only elapses when the companion is truly absent.
+        let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let tx = loop {
             let sender = self
                 .inner

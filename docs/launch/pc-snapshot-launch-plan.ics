@@ -1,0 +1,145 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//PC Snapshot//Launch Plan 2026//EN
+CALSCALE:GREGORIAN
+METHOD:PUBLISH
+X-WR-CALNAME:PC Snapshot Launch Plan
+X-WR-TIMEZONE:Asia/Kolkata
+BEGIN:VEVENT
+UID:pcsnap-m0-product-stable@pc-snapshot
+DTSTAMP:20260716T120000Z
+DTSTART;VALUE=DATE:20260726
+DTEND;VALUE=DATE:20260727
+SUMMARY:🏁 MILESTONE: Product stable (debugging done)
+DESCRIPTION:Hard deadline: PC Snapshot feature-complete and stable. Everything after this date is commercialization\, not product work. Plan: docs/launch/08-solo-6-month-timeline.md
+END:VEVENT
+BEGIN:VEVENT
+UID:pcsnap-w01@pc-snapshot
+DTSTAMP:20260716T120000Z
+DTSTART;VALUE=DATE:20260727
+DTEND;VALUE=DATE:20260728
+SUMMARY:W1 — Make the repo receptive (v0.9.0 beta release)
+DESCRIPTION:Due by Sun Aug 2:\n- Record 15-sec capture→restore demo\; GIF at TOP of README\n- v0.9.0 installer (Tauri NSIS) that also registers the companion native host\n- BETA.md (what works / what doesn't / how to report)\n- Issue template: what broke? what confused? would you pay $29?\n- Enable GitHub Discussions\n- Add README note: paid Pro tier coming\, free core stays free\n- Say "source-available"\, never "open source" (PolyForm)
+END:VEVENT
+BEGIN:VEVENT
+UID:pcsnap-w02@pc-snapshot
+DTSTAMP:20260716T120000Z
+DTSTART;VALUE=DATE:20260803
+DTEND;VALUE=DATE:20260804
+SUMMARY:W2 — Hand-recruit 20-30 beta testers
+DESCRIPTION:Due by Sun Aug 9:\n- Personal network outreach\n- Post in 2-3 Discords/Slacks where you have standing (show-your-project channels)\n- Post to r/SideProject + r/coolgithubprojects\n- 10 personal DMs to devs you respect: "would you break this for me?"\n- Target: 20-30 real installs\, feedback flowing\nNOT yet: HN\, Product Hunt (save for paid launch)
+END:VEVENT
+BEGIN:VEVENT
+UID:pcsnap-w03@pc-snapshot
+DTSTAMP:20260716T120000Z
+DTSTART;VALUE=DATE:20260810
+DTEND;VALUE=DATE:20260811
+SUMMARY:W3 — Fix visibly (v0.9.1) + buy domain
+DESCRIPTION:Due by Sun Aug 16:\n- Triage all beta feedback\; ship v0.9.1 fast\n- Reply to every issue/Discussion\n- Log objections verbatim (future FAQ/copy)\n- Register domain (~$12\, Cloudflare Registrar)\n- Set up hello@ and support@ (Zoho Mail free)
+END:VEVENT
+BEGIN:VEVENT
+UID:pcsnap-w04@pc-snapshot
+DTSTAMP:20260716T120000Z
+DTSTART;VALUE=DATE:20260817
+DTEND;VALUE=DATE:20260818
+SUMMARY:W4 — Wider beta post + GO/NO-GO gate (order cert)
+DESCRIPTION:Due by Sun Aug 23:\n- Beta-framed post to r/windows or r/software ("it's beta\, tell me what breaks")\n- Target: 100-300 cumulative installs\n- GATE: if strangers install + problem resonates → ORDER SSL.com OV code-signing cert (~$250\, validation 3-10 business days\, builds SmartScreen reputation before paid launch)\n- If signal is dead: stop and reassess (~$12 spent)
+END:VEVENT
+BEGIN:VEVENT
+UID:pcsnap-w05@pc-snapshot
+DTSTAMP:20260716T120000Z
+DTSTART;VALUE=DATE:20260824
+DTEND;VALUE=DATE:20260825
+SUMMARY:W5 — Landing page live
+DESCRIPTION:Due by Sun Aug 30:\n- Static site on Cloudflare Pages using docs/launch/05-landing-page-copy.md\n- Hero GIF/video\n- MailerLite email-capture form\n- Cloudflare Web Analytics\n- Keep answering beta feedback (~1h)
+END:VEVENT
+BEGIN:VEVENT
+UID:pcsnap-w06@pc-snapshot
+DTSTAMP:20260716T120000Z
+DTSTART;VALUE=DATE:20260831
+DTEND;VALUE=DATE:20260901
+SUMMARY:W6 — Implement Free/Pro boundary + 30-day trial
+DESCRIPTION:Due by Sun Sep 6 (the one product-code week):\n- Free tier: 3 most recent snapshots\; older read-only\, never deleted\n- 30-day keyless full-Pro trial\; expiry reverts to Free with zero data loss\n- Spec: docs/launch/03-commercial-strategy.md sections 3 and 5
+END:VEVENT
+BEGIN:VEVENT
+UID:pcsnap-w07@pc-snapshot
+DTSTAMP:20260716T120000Z
+DTSTART;VALUE=DATE:20260907
+DTEND;VALUE=DATE:20260908
+SUMMARY:W7 — Money plumbing (Paddle + Keygen end-to-end)
+DESCRIPTION:Due by Sun Sep 13:\n- Paddle account as individual/sole trader (fallback: Gumroad\, built-in keys\, 10% fee)\n- Keygen.sh free tier: 3 activations\, offline grace\n- Webhook → license key → delivery email → activation\, end-to-end in sandbox\n- Test a refund round-trip
+END:VEVENT
+BEGIN:VEVENT
+UID:pcsnap-w08@pc-snapshot
+DTSTAMP:20260716T120000Z
+DTSTART;VALUE=DATE:20260914
+DTEND;VALUE=DATE:20260915
+SUMMARY:W8 — Signed release + auto-updater (v1.0.0-rc)
+DESCRIPTION:Due by Sun Sep 20:\n- Code signing wired into release pipeline\n- Tauri updater against GitHub Releases (latest.json + SHA-256)\n- Ship v1.0.0-rc to beta cohort\n- Verify one real auto-update on a tester machine
+END:VEVENT
+BEGIN:VEVENT
+UID:pcsnap-w09@pc-snapshot
+DTSTAMP:20260716T120000Z
+DTSTART;VALUE=DATE:20260921
+DTEND;VALUE=DATE:20260922
+SUMMARY:W9 — Testimonials\, docs\, legal\, store submissions
+DESCRIPTION:Due by Sun Sep 27:\n- Ask best testers for one quotable sentence + "would you have paid?"\n- Docs: getting started\, per-browser companion setup\, known limitations\, license FAQ\n- Privacy policy (honest: "we collect nothing")\, EULA\, terms\, refund policy from templates\n- winget manifest PR\n- Chrome Web Store ($5) + Edge Add-ons companion submissions
+END:VEVENT
+BEGIN:VEVENT
+UID:pcsnap-w10@pc-snapshot
+DTSTAMP:20260716T120000Z
+DTSTART;VALUE=DATE:20260928
+DTEND;VALUE=DATE:20260929
+SUMMARY:W10 — Launch prep + FREEZE
+DESCRIPTION:Due by Sun Oct 4:\n- Product Hunt listing scheduled for Oct 7\n- Show HN draft (technical\, candid about limitations)\n- 3 subreddit-tailored post drafts (check each sub's self-promo rules)\n- Launch email drafted\n- Full clean-VM pass: install → onboard → capture → restore → buy → activate → update\n- Freeze: nothing changes after this week\nChecklists: docs/launch/06-launch-checklists.md
+END:VEVENT
+BEGIN:VEVENT
+UID:pcsnap-launch@pc-snapshot
+DTSTAMP:20260716T120000Z
+DTSTART;VALUE=DATE:20261007
+DTEND;VALUE=DATE:20261008
+SUMMARY:🚀 LAUNCH DAY — take the full day off
+DESCRIPTION:Wed Oct 7 2026 — the one day needing more than 8h:\n- 12:31 PM IST: Product Hunt live (12:01 AM PT)\; founder comment within 5 min\n- ~5:30-6:30 PM IST: Show HN\; stay in thread 4-6h\, answer honestly\, concede limitations\n- Reddit posts staggered per sub rules\n- X thread with hero video\; launch email to list\n- Launch-week price $24 (dated\, real\, never extended)\; then $29\n- Fix nothing live except showstoppers\; log every objection verbatim
+END:VEVENT
+BEGIN:VEVENT
+UID:pcsnap-w12@pc-snapshot
+DTSTAMP:20260716T120000Z
+DTSTART;VALUE=DATE:20261012
+DTEND;VALUE=DATE:20261013
+SUMMARY:W12 — Convert the launch aftermath
+DESCRIPTION:Due by Sun Oct 18:\n- v1.0.1 for launch papercuts within 72h\n- Keep answering every thread/comment/support email\n- Retrospective: traffic sources\, download→trial→purchase\, top 5 objections → FAQ/copy edits\n- Personal thank-you + check-in email to every buyer
+END:VEVENT
+BEGIN:VEVENT
+UID:pcsnap-rhythm@pc-snapshot
+DTSTAMP:20260716T120000Z
+DTSTART;VALUE=DATE:20261019
+DTEND;VALUE=DATE:20261020
+RRULE:FREQ=WEEKLY;COUNT=14
+SUMMARY:Growth rhythm week (8h: 2 support / 3 ship / 3 market)
+DESCRIPTION:Standing weekly split:\n- 2h: support inbox\, GitHub issues\, Discussions\n- 3h: shipping (Nov: Fresh Session mini-launch\; Dec: Firefox companion\; Jan: v1.1)\n- 3h: marketing\, rotating 4-week cycle:\n  wk1 SEO/comparison page from real support questions\n  wk2 10 personal creator/newsletter pitches\n  wk3 technical write-up (first: exact-tab restore via native messaging → HN)\n  wk4 monthly changelog newsletter\nPlan: docs/launch/08-solo-6-month-timeline.md
+END:VEVENT
+BEGIN:VEVENT
+UID:pcsnap-m-freshsession@pc-snapshot
+DTSTAMP:20260716T120000Z
+DTSTART;VALUE=DATE:20261116
+DTEND;VALUE=DATE:20261117
+SUMMARY:🎯 MILESTONE: Fresh Session mini-launch (target week)
+DESCRIPTION:Ship the Fresh Session feature (spec: features/pending/fresh_session.md) and announce as a mini-launch: newsletter + Reddit + X. Strong demo material: capture → clean slate → restore.
+END:VEVENT
+BEGIN:VEVENT
+UID:pcsnap-m-firefox@pc-snapshot
+DTSTAMP:20260716T120000Z
+DTSTART;VALUE=DATE:20261207
+DTEND;VALUE=DATE:20261208
+SUMMARY:🎯 MILESTONE: Firefox companion work begins
+DESCRIPTION:Start the Firefox companion (spec: features/pending/browser_companion_restore.md). Realistically spans several weeks at 8h/wk. Unlocks the privacy-conscious segment most aligned with local-first messaging\; announce as mini-launch when done (r/firefox + HN + newsletter).
+END:VEVENT
+BEGIN:VEVENT
+UID:pcsnap-m-review@pc-snapshot
+DTSTAMP:20260716T120000Z
+DTSTART;VALUE=DATE:20270118
+DTEND;VALUE=DATE:20270119
+SUMMARY:🎯 MILESTONE: v1.1 + 6-month metrics review
+DESCRIPTION:Ship v1.1 (quarter's accumulated work). Review against checkpoints:\n- Sustainable side income test: $200-800/mo?\n- >50% of downloads from search/word-of-mouth?\n- If top of band: engage CA\, register GST\, consider raising hours\n- If below bottom: find the one broken funnel stage via buyer/non-buyer interviews (not more channels)\nCheckpoints: docs/launch/08-solo-6-month-timeline.md
+END:VEVENT
+END:VCALENDAR

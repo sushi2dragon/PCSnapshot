@@ -12,6 +12,32 @@ dist
 dist-ssr
 *.local
 
+# Local environment, credentials, and machine-specific agent settings
+.env
+.env.*
+!.env.example
+!.env.*.example
+.claude/settings.local.json
+.claude/*.local.json
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+
+# PC Snapshot user data (the live store is in Windows AppData, outside this repo)
+/Snapshots/
+/snapshots/
+/snapshot-data/
+/.pc-snapshot/
+/activity.jsonl
+/snap_*.json
+/snap_*.png
+
+# Rust / Tauri build output
+src-tauri/target
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

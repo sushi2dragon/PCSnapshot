@@ -137,6 +137,36 @@ async function connectNative() {
   }
 }
 
-api.runtime.onInstalled.addListener(() => { void connectNative(); });
-api.runtime.onStartup.addListener(() => { void connectNative(); });
+// The MV3 service worker is torn down after ~30s idle, which drops the native
+// connection; nothing re-establishes it until the extension is manually reloaded.
+// A short-period alarm both wakes the worker (each firing resets the idle timer)
+// and reconnects if the port was lost — no user interaction, install-and-forget.
+// The desktop host also heartbeats to keep the worker warm between alarm ticks.
+const KEEPALIVE_ALARM = "pcs-companion-keepalive";
+
+function ensureKeepaliveAlarm() {
+  api.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.4 });
+}
+
+api.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === KEEPALIVE_ALARM) void connectNative();
+});
+
+// The alarm is a 30s floor (Chrome clamps sub-30s periods), and the host heartbeat
+// only keeps the worker warm while the desktop app is running to send it. So when
+// the app is closed, the worker dies every ~30s; reopening the app and capturing
+// right away finds a dead port and no connected session — the "reload the extension
+// to fix it" symptom. Reconnecting on ordinary browser activity closes that gap:
+// any tab switch, navigation, or window focus while the user is in the browser wakes
+// the worker and re-establishes the native port immediately instead of waiting for
+// the next alarm tick. connectNative() is a no-op when already connected, so these
+// high-frequency events are cheap.
+function wakeAndConnect() { void connectNative(); }
+api.tabs.onActivated.addListener(wakeAndConnect);
+api.tabs.onUpdated.addListener(wakeAndConnect);
+if (api.windows?.onFocusChanged) api.windows.onFocusChanged.addListener(wakeAndConnect);
+
+api.runtime.onInstalled.addListener(() => { ensureKeepaliveAlarm(); void connectNative(); });
+api.runtime.onStartup.addListener(() => { ensureKeepaliveAlarm(); void connectNative(); });
+ensureKeepaliveAlarm();
 void connectNative();

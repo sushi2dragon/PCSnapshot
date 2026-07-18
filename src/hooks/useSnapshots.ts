@@ -53,6 +53,13 @@ export function useSnapshots() {
     []
   );
 
+  const restoreApp = useCallback(
+    async (id: string, exePath: string): Promise<RestoreResult> => {
+      return commands.restoreApp(id, exePath);
+    },
+    []
+  );
+
   const recapture = useCallback(
     async (id: string): Promise<string[]> => {
       const result = await commands.recaptureSnapshot(id);
@@ -72,5 +79,5 @@ export function useSnapshots() {
     []
   );
 
-  return { snapshots, loading, capture, recapture, restore, remove, refresh };
+  return { snapshots, loading, capture, recapture, restore, restoreApp, remove, refresh };
 }

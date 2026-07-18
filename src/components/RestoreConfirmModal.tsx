@@ -120,7 +120,7 @@ export function RestoreConfirmModal({
             <button
               onClick={onSaveFirst}
               className="px-3.5 py-1.5 rounded-md text-sm font-medium transition-colors mr-auto"
-              style={{ backgroundColor: "rgba(43,111,219,0.15)", color: "var(--color-accent)" }}
+              style={{ backgroundColor: "rgba(59,127,235,0.22)", color: "#3B7FEB" }}
             >
               Save current first
             </button>
@@ -135,7 +135,7 @@ export function RestoreConfirmModal({
           <button
             onClick={() => onConfirm(closeOthers)}
             className="px-4 py-1.5 rounded-md text-sm font-semibold transition-colors"
-            style={{ backgroundColor: "var(--color-accent)", color: "#fff" }}
+            style={{ backgroundColor: "#3B7FEB", color: "#fff" }}
           >
             Restore
           </button>

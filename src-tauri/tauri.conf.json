@@ -13,11 +13,14 @@
     "windows": [
       {
         "title": "PC Snapshot",
-        "width": 1024,
-        "height": 700,
+        "width": 960,
+        "height": 640,
+        "minWidth": 720,
+        "minHeight": 500,
         "resizable": true,
         "fullscreen": false,
-        "backgroundColor": "#1c1c1f"
+        "decorations": false,
+        "backgroundColor": "#0F1012"
       }
     ],
     "security": {

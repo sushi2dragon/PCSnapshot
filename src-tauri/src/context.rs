@@ -54,11 +54,26 @@ fn ide_context(
     clues: &mut Vec<ContextClue>,
     hints: &mut Vec<String>,
 ) {
+    let stem = exe_stem(&proc_.exe_path);
+    let vscode_paths: std::collections::HashMap<String, String> =
+        crate::vscode::open_folders(&stem)
+            .into_iter()
+            .filter_map(|path| {
+                let name = std::path::Path::new(&path)
+                    .file_name()?
+                    .to_string_lossy()
+                    .to_ascii_lowercase();
+                Some((name, path))
+            })
+            .collect();
+
     // ── Workspace from command line ──────────────────────────────────────────
     // The cmd_line is stored as a quoted shell string (argv[0] included).
     // First non-flag argument after argv[0] is the workspace / folder / file.
     let args = crate::tokenize(&proc_.cmd_line);
-    let workspace: Option<String> = args.iter().skip(1)
+    let workspace: Option<String> = args
+        .iter()
+        .skip(1)
         .find(|a| !a.starts_with('-') && a.len() > 2 && (a.contains('\\') || a.contains('/')))
         .cloned();
 
@@ -75,12 +90,25 @@ fn ide_context(
     // ── Active folder / file from window title ────────────────────────────────
     // VSCode titles follow: "[● ]<filename> — <folder> — Visual Studio Code"
     // or just "<folder> — Visual Studio Code" / "<folder> — Cursor"
-    for win in windows.iter().filter(|w| {
-        !w.exe_path.is_empty() && w.exe_path.eq_ignore_ascii_case(&proc_.exe_path)
-    }) {
+    for win in windows
+        .iter()
+        .filter(|w| !w.exe_path.is_empty() && w.exe_path.eq_ignore_ascii_case(&proc_.exe_path))
+    {
         if let Some(folder) = vscode_folder_from_title(&win.title) {
+            if let Some(full_path) = vscode_paths.get(&folder.to_ascii_lowercase()) {
+                clues.push(ContextClue {
+                    clue_type: "vscode_folder".to_string(),
+                    value: full_path.clone(),
+                    confidence: 0.9,
+                    source: "vscode_state".to_string(),
+                });
+                hints.push(format!("vscode_folder:{full_path}"));
+            }
             // Only emit if it differs from the workspace we already found.
-            if workspace.as_deref().map_or(true, |ws| !ws.contains(&folder)) {
+            if workspace
+                .as_deref()
+                .map_or(true, |ws| !ws.contains(&folder))
+            {
                 clues.push(ContextClue {
                     clue_type: "vscode_active_folder".to_string(),
                     value: folder,
@@ -94,7 +122,7 @@ fn ide_context(
 
 /// Extract the folder segment from a VSCode / Cursor window title.
 /// e.g. "main.rs — pc-snapshot — Visual Studio Code" → "pc-snapshot"
-fn vscode_folder_from_title(title: &str) -> Option<String> {
+pub(crate) fn vscode_folder_from_title(title: &str) -> Option<String> {
     // Strip editor names
     let base = title
         .strip_suffix(" - Visual Studio Code")
@@ -108,19 +136,23 @@ fn vscode_folder_from_title(title: &str) -> Option<String> {
     let base = base.trim_start_matches(['●', '•', ' ']);
 
     // The last segment separated by " - " or " — " is the folder.
-    let sep = if base.contains(" — ") { " — " } else { " - " };
+    let sep = if base.contains(" — ") {
+        " — "
+    } else {
+        " - "
+    };
     let folder = base.rsplit(sep).next()?.trim().to_string();
 
-    if folder.is_empty() { None } else { Some(folder) }
+    if folder.is_empty() {
+        None
+    } else {
+        Some(folder)
+    }
 }
 
 // ── Browser ───────────────────────────────────────────────────────────────────
 
-fn browser_context(
-    proc_: &ProcessInfo,
-    windows: &[WindowInfo],
-    clues: &mut Vec<ContextClue>,
-) {
+fn browser_context(proc_: &ProcessInfo, windows: &[WindowInfo], clues: &mut Vec<ContextClue>) {
     let browser_name = exe_stem(&proc_.exe_path);
 
     clues.push(ContextClue {
@@ -131,7 +163,8 @@ fn browser_context(
     });
 
     // Count windows belonging to this browser as a rough tab proxy.
-    let win_count = windows.iter()
+    let win_count = windows
+        .iter()
         .filter(|w| !w.exe_path.is_empty() && w.exe_path.eq_ignore_ascii_case(&proc_.exe_path))
         .count();
     if win_count > 0 {
@@ -144,9 +177,10 @@ fn browser_context(
     }
 
     // Detect localhost tabs — title contains "localhost" or "127.0.0.1".
-    for win in windows.iter().filter(|w| {
-        !w.exe_path.is_empty() && w.exe_path.eq_ignore_ascii_case(&proc_.exe_path)
-    }) {
+    for win in windows
+        .iter()
+        .filter(|w| !w.exe_path.is_empty() && w.exe_path.eq_ignore_ascii_case(&proc_.exe_path))
+    {
         let lower = win.title.to_ascii_lowercase();
         if lower.contains("localhost") || lower.contains("127.0.0.1") {
             // Try to extract the port from titles like "Vite App — localhost:5173"
@@ -169,21 +203,22 @@ fn browser_context(
 fn extract_localhost_port(title: &str) -> Option<String> {
     // Match "localhost:NNNN" or "127.0.0.1:NNNN"
     let lower = title.to_ascii_lowercase();
-    let marker = lower.find("localhost:")
+    let marker = lower
+        .find("localhost:")
         .map(|i| i + "localhost:".len())
         .or_else(|| lower.find("127.0.0.1:").map(|i| i + "127.0.0.1:".len()))?;
     let rest = &title[marker..];
     let port: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if port.is_empty() { None } else { Some(port) }
+    if port.is_empty() {
+        None
+    } else {
+        Some(port)
+    }
 }
 
 // ── Terminal ──────────────────────────────────────────────────────────────────
 
-fn terminal_context(
-    proc_: &ProcessInfo,
-    windows: &[WindowInfo],
-    clues: &mut Vec<ContextClue>,
-) {
+fn terminal_context(proc_: &ProcessInfo, windows: &[WindowInfo], clues: &mut Vec<ContextClue>) {
     let stem = exe_stem(&proc_.exe_path);
 
     // Emit shell type.
@@ -205,9 +240,10 @@ fn terminal_context(
     // PowerShell titles: "Windows PowerShell" or the current path.
     // cmd.exe titles: often show the CWD directly.
     // Windows Terminal: tab title can be the CWD or app name.
-    for win in windows.iter().filter(|w| {
-        !w.exe_path.is_empty() && w.exe_path.eq_ignore_ascii_case(&proc_.exe_path)
-    }) {
+    for win in windows
+        .iter()
+        .filter(|w| !w.exe_path.is_empty() && w.exe_path.eq_ignore_ascii_case(&proc_.exe_path))
+    {
         if let Some(cwd) = cwd_from_terminal_title(&win.title) {
             clues.push(ContextClue {
                 clue_type: "terminal_cwd".to_string(),
@@ -225,7 +261,13 @@ fn terminal_context(
 fn cwd_from_terminal_title(title: &str) -> Option<String> {
     let t = title.trim();
     // Skip generic titles.
-    if matches!(t, "Windows PowerShell" | "Command Prompt" | "PowerShell" | "Administrator: Windows PowerShell") {
+    if matches!(
+        t,
+        "Windows PowerShell"
+            | "Command Prompt"
+            | "PowerShell"
+            | "Administrator: Windows PowerShell"
+    ) {
         return None;
     }
     // A title that looks like an absolute Windows path is the CWD.
@@ -241,11 +283,7 @@ fn cwd_from_terminal_title(title: &str) -> Option<String> {
 
 // ── Dev servers ───────────────────────────────────────────────────────────────
 
-fn devserver_context(
-    proc_: &ProcessInfo,
-    clues: &mut Vec<ContextClue>,
-    hints: &mut Vec<String>,
-) {
+fn devserver_context(proc_: &ProcessInfo, clues: &mut Vec<ContextClue>, hints: &mut Vec<String>) {
     let stem = exe_stem(&proc_.exe_path);
     let cmd_lower = proc_.cmd_line.to_ascii_lowercase();
 
@@ -339,10 +377,14 @@ fn extract_port(cmd: &str) -> Option<String> {
     let lower = cmd.to_ascii_lowercase();
     if let Some(pos) = lower.find("--port=").or_else(|| lower.find("--port ")) {
         let after = &cmd[pos + 7..];
-        let port: String = after.chars().skip_while(|c| !c.is_ascii_digit())
+        let port: String = after
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
             .take_while(|c| c.is_ascii_digit())
             .collect();
-        if !port.is_empty() { return Some(port); }
+        if !port.is_empty() {
+            return Some(port);
+        }
     }
     // ":NNNN" at end — Vite prints "localhost:5173" in its output, not in cmd line,
     // but some tools pass the port at the end like "server :3000"
@@ -362,24 +404,25 @@ fn office_context(
 ) {
     let office_apps: &[(&str, &str, &str)] = &[
         // (exe_stem, Office registry app name, title suffix to strip)
-        ("excel",    "Excel",      " - Excel"),
-        ("winword",  "Word",       " - Word"),
+        ("excel", "Excel", " - Excel"),
+        ("winword", "Word", " - Word"),
         ("powerpnt", "PowerPoint", " - PowerPoint"),
-        ("onenote",  "OneNote",    " - OneNote"),
+        ("onenote", "OneNote", " - OneNote"),
     ];
 
     for (exe_stem_str, reg_app, title_suffix) in office_apps {
         // Find the process for this Office app.
-        let Some(proc_) = processes.iter().find(|p| {
-            exe_stem(&p.exe_path) == *exe_stem_str
-        }) else { continue };
+        let Some(proc_) = processes
+            .iter()
+            .find(|p| exe_stem(&p.exe_path) == *exe_stem_str)
+        else {
+            continue;
+        };
 
         // Collect all windows belonging to this process.
-        let app_windows: Vec<&WindowInfo> = windows.iter()
-            .filter(|w| {
-                !w.exe_path.is_empty()
-                    && w.exe_path.eq_ignore_ascii_case(&proc_.exe_path)
-            })
+        let app_windows: Vec<&WindowInfo> = windows
+            .iter()
+            .filter(|w| !w.exe_path.is_empty() && w.exe_path.eq_ignore_ascii_case(&proc_.exe_path))
             .collect();
 
         if app_windows.is_empty() {
@@ -387,7 +430,8 @@ fn office_context(
         }
 
         // Extract filenames from window titles.
-        let window_files: Vec<String> = app_windows.iter()
+        let window_files: Vec<String> = app_windows
+            .iter()
             .filter_map(|w| office_filename_from_title(&w.title, title_suffix))
             .collect();
 
@@ -405,7 +449,8 @@ fn office_context(
         for filename in &window_files {
             let fname_lower = filename.to_ascii_lowercase();
             if let Some(full_path) = mru_paths.iter().find(|p| {
-                p.rsplit(|c| c == '\\' || c == '/').next()
+                p.rsplit(|c| c == '\\' || c == '/')
+                    .next()
                     .map(|f| f.to_ascii_lowercase() == fname_lower)
                     .unwrap_or(false)
             }) {
@@ -445,10 +490,13 @@ fn office_context(
         if app_windows.len() > 1 {
             // Determine which file is already covered by cmd_line.
             let cmdline_file = cmdline_first_path(&proc_.cmd_line);
-            let extra_paths: Vec<&String> = matched_paths.iter()
-                .filter(|p| cmdline_file.as_deref().map_or(true, |cf| {
-                    !p.to_ascii_lowercase().ends_with(&cf.to_ascii_lowercase())
-                }))
+            let extra_paths: Vec<&String> = matched_paths
+                .iter()
+                .filter(|p| {
+                    cmdline_file.as_deref().map_or(true, |cf| {
+                        !p.to_ascii_lowercase().ends_with(&cf.to_ascii_lowercase())
+                    })
+                })
                 .collect();
 
             for path in extra_paths {
@@ -463,7 +511,8 @@ fn office_context(
 /// "Document1 - Microsoft Word" → "Document1"
 fn office_filename_from_title(title: &str, suffix: &str) -> Option<String> {
     // Try exact suffix first, then "Microsoft ..." variant.
-    let base = title.strip_suffix(suffix)
+    let base = title
+        .strip_suffix(suffix)
         .or_else(|| {
             let ms = format!(" - Microsoft{}", &suffix[2..]); // " - Microsoft Excel"
             title.strip_suffix(ms.as_str())
@@ -472,10 +521,13 @@ fn office_filename_from_title(title: &str, suffix: &str) -> Option<String> {
             // Newer Office can append extra info: "Budget.xlsx - Excel  (Reading Mode)"
             if let Some(idx) = title.rfind(suffix) {
                 Some(&title[..idx])
-            } else { None }
+            } else {
+                None
+            }
         })?;
 
-    let name = base.trim()
+    let name = base
+        .trim()
         .trim_start_matches('[') // "[Compatibility Mode]" prefix
         .trim()
         .to_string();
@@ -485,13 +537,18 @@ fn office_filename_from_title(title: &str, suffix: &str) -> Option<String> {
     // lookup matches by extension-bearing name) are useful for restore. A
     // substring test like contains("New") would wrongly drop legitimate files
     // such as "Newsletter_Q3.xlsx".
-    if name.is_empty() || !name.contains('.') { None } else { Some(name) }
+    if name.is_empty() || !name.contains('.') {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 /// Extract the first filesystem-path argument from a cmd_line (argv[0] stripped).
 fn cmdline_first_path(cmd_line: &str) -> Option<String> {
     let args = crate::tokenize(cmd_line);
-    args.into_iter().skip(1)
+    args.into_iter()
+        .skip(1)
         .find(|a| !a.starts_with('-') && (a.contains('\\') || a.contains('/')) && a.len() > 3)
 }
 
@@ -510,12 +567,16 @@ fn office_mru_paths(app_name: &str) -> Vec<String> {
             version, app_name
         );
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let Ok(key) = hkcu.open_subkey(&key_path) else { continue };
+        let Ok(key) = hkcu.open_subkey(&key_path) else {
+            continue;
+        };
 
         let mut paths: Vec<String> = Vec::new();
         for i in 1u32..=25 {
             let item_name = format!("Item {}", i);
-            let Ok(value): Result<String, _> = key.get_value(&item_name) else { break };
+            let Ok(value): Result<String, _> = key.get_value(&item_name) else {
+                break;
+            };
             // Registry value format: "[F00000000][T01D9C5B6D0F6E000]*C:\path\to\file.xlsx"
             if let Some(path) = value.rsplit('*').next() {
                 let path = path.trim().to_string();
@@ -541,7 +602,13 @@ fn office_mru_paths(_app_name: &str) -> Vec<String> {
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
 fn exe_stem(exe_path: &str) -> String {
-    let last = exe_path.rsplit(|c| c == '\\' || c == '/').next().unwrap_or(exe_path);
-    let stem = last.strip_suffix(".exe").or_else(|| last.strip_suffix(".EXE")).unwrap_or(last);
+    let last = exe_path
+        .rsplit(|c| c == '\\' || c == '/')
+        .next()
+        .unwrap_or(exe_path);
+    let stem = last
+        .strip_suffix(".exe")
+        .or_else(|| last.strip_suffix(".EXE"))
+        .unwrap_or(last);
     stem.to_ascii_lowercase()
 }

@@ -15,10 +15,11 @@ import { terminalHookStatus, setTerminalHook } from "./commands/config";
 import type { RestoreResult } from "./types/snapshot";
 
 function App() {
-  const { snapshots, loading, capture, recapture, restore, remove, refresh } = useSnapshots();
+  const { snapshots, loading, capture, recapture, restore, restoreApp, remove, refresh } = useSnapshots();
   const [modalOpen, setModalOpen] = useState(false);
   const [toast, setToast] = useState<{ message: string; type: "success" | "warning" } | null>(null);
   const [restoreReport, setRestoreReport] = useState<RestoreResult | null>(null);
+  const [restoringAppKey, setRestoringAppKey] = useState<string | null>(null);
   // Restore confirmation flow
   const [confirmRestore, setConfirmRestore] = useState<{ id: string; name: string } | null>(null);
   const [currentStateSaved, setCurrentStateSaved] = useState<boolean | null>(null);
@@ -140,6 +141,28 @@ function App() {
       }
     },
     [confirmRestore, restore, refreshActivity]
+  );
+
+  const handleRestoreApp = useCallback(
+    async (id: string, exePath: string, appName: string) => {
+      const key = `${id}:${exePath.toLowerCase()}`;
+      setRestoringAppKey(key);
+      try {
+        const result = await restoreApp(id, exePath);
+        await refreshActivity();
+        const hasDetail = result.failed_items.length > 0 || result.warnings.length > 0;
+        if (!result.success || hasDetail) {
+          setRestoreReport(result);
+        } else {
+          setToast({ message: result.message, type: "success" });
+        }
+      } catch (e) {
+        setToast({ message: `${appName} restore failed: ${e}`, type: "warning" });
+      } finally {
+        setRestoringAppKey(null);
+      }
+    },
+    [restoreApp, refreshActivity]
   );
 
   // "Save current first": stash the target, then open the capture name prompt.
@@ -266,6 +289,7 @@ function App() {
       <MissionControl snapshots={snapshots} events={events} selectedId={selectedId} onSelect={setSelectedId}
         activeSessionId={activeId}
         onCapture={handleTakeSnapshot} onStartNew={() => setStartNewOpen(true)} onRestore={handleRestore}
+        onRestoreApp={handleRestoreApp} restoringAppKey={restoringAppKey}
         onDelete={handleDelete} onRecapture={handleRecapture} onClearAll={handleClearAll} onImport={handleImport}
         onHelp={handleHelp} onRefresh={handleRefresh} onIgnoreList={() => setShowIgnoreList(true)}
         onToggleTerminalHook={handleToggleTerminalHook} terminalHookEnabled={terminalHookEnabled}/>

@@ -39,6 +39,22 @@ async fn run() {
     std::thread::spawn(move || native_reader(to_pipe_tx));
     std::thread::spawn(move || native_writer(to_browser_rx));
 
+    // Keep the browser's MV3 service worker alive. A native-messaging port that
+    // goes idle for ~30s is torn down along with the worker, after which nothing
+    // wakes it until the user manually reloads the extension. A periodic message
+    // resets that idle timer, so the companion stays connected and every capture
+    // finds a live session. The extension ignores this message type.
+    let heartbeat_tx = to_browser_tx.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(20));
+        if heartbeat_tx
+            .send(serde_json::json!({ "protocol_version": 1, "type": "heartbeat" }))
+            .is_err()
+        {
+            return;
+        }
+    });
+
     let writer = tokio::spawn(async move {
         while let Some(message) = to_pipe_rx.recv().await {
             let Ok(bytes) = serde_json::to_vec(&message) else { continue; };
@@ -79,23 +95,29 @@ fn native_reader(out: tokio::sync::mpsc::UnboundedSender<Value>) {
     loop {
         let mut header = [0_u8; 4];
         if input.read_exact(&mut header).is_err() {
-            return;
+            // Browser closed the native-messaging port (window/profile closed).
+            // The main task is blocked reading the *pipe*, not stdin, so it would
+            // otherwise keep this process — and its bridge pipe — alive. That leaves
+            // a zombie "connected profile" the desktop app still asks to capture and
+            // that never answers. Exit so the pipe drops and the bridge prunes it.
+            std::process::exit(0);
         }
         let size = u32::from_le_bytes(header) as usize;
         if size > MAX_NATIVE_MESSAGE_BYTES {
             eprintln!("native message exceeded product limit");
-            return;
+            std::process::exit(0);
         }
         let mut payload = vec![0_u8; size];
         if input.read_exact(&mut payload).is_err() {
-            return;
+            std::process::exit(0);
         }
         let Ok(message) = serde_json::from_slice::<Value>(&payload) else {
             eprintln!("native message was not valid JSON");
             continue;
         };
         if out.send(message).is_err() {
-            return;
+            // Bridge side is gone; nothing left to relay.
+            std::process::exit(0);
         }
     }
 }

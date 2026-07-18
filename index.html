@@ -24,5 +24,40 @@
       <div id="boot"><div class="ring"></div><div>Loading PC Snapshot…</div></div>
     </div>
     <script type="module" src="/src/main.tsx"></script>
+    <script>
+      /* Boot self-heal. On system sleep, Windows can trim/terminate the WebView2
+         renderer; on resume WebView2 re-navigates and reloads this page. In dev the
+         module graph is fetched from the Vite server (localhost:5173), and a fetch
+         that fails on resume has no retry — React never mounts and the #boot splash
+         above stays up forever. Detect a failed mount and reload, bounded via
+         sessionStorage so it can never loop. Prod (local files) rarely trips this. */
+      (function () {
+        var KEY = "pcs-boot-retries";
+        var MAX = 3;
+        function retryReload() {
+          var n = parseInt(sessionStorage.getItem(KEY) || "0", 10) || 0;
+          if (n >= MAX) return; // give up — leave the splash so the failure is visible
+          sessionStorage.setItem(KEY, String(n + 1));
+          location.reload();
+        }
+        // Fast path: a boot script/stylesheet failed to load. Resource-load errors
+        // don't bubble, so listen in the capture phase. Guard tightly so we only act
+        // on a genuine boot failure: the target must be a SCRIPT or a stylesheet LINK
+        // (not the favicon), and the splash must still be up (post-mount runtime
+        // errors must never trigger a reload). Works in dev and prod — no id needed,
+        // which matters because Vite hoists the entry script and drops its attributes.
+        window.addEventListener("error", function (e) {
+          var t = e.target;
+          if (!t || !document.getElementById("boot")) return;
+          if (t.tagName === "SCRIPT" || (t.tagName === "LINK" && t.rel === "stylesheet")) retryReload();
+        }, true);
+        // Backstop: React never replaced the splash within the window (silent hang).
+        // Generous timeout so a genuinely cold Vite start isn't reloaded out from under.
+        window.setTimeout(function () {
+          if (document.getElementById("boot")) retryReload();
+          else sessionStorage.removeItem(KEY); // mounted OK → reset the budget for next time
+        }, 15000);
+      })();
+    </script>
   </body>
 </html>

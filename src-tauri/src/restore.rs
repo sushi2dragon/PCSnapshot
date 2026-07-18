@@ -20,7 +20,7 @@ pub fn restore_desktop(
     ignore_list: &[String],
     companion_managed_browsers: bool,
 ) -> RestoreResult {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
 
     let mut failed_items: Vec<String> = vec![];
@@ -69,6 +69,9 @@ pub fn restore_desktop(
             if p.exe_path.is_empty() {
                 return true; // let it through so the error path can report it
             }
+            if is_vscode_family(&p.exe_path) {
+                return false;
+            }
             if crate::config::is_ignored(&exe_stem(&p.exe_path), ignore_list) {
                 return false;
             }
@@ -85,17 +88,22 @@ pub fn restore_desktop(
         .collect();
     launch_list.sort_by_key(|p| Category::from_str(&p.classification).launch_rank());
 
-    let mut terminal_index: usize = 0;
+    let mut terminal_indices: HashMap<String, usize> = HashMap::new();
+    let mut extra_window_exes_handled: HashSet<String> = HashSet::new();
 
     for proc_ in &launch_list {
         if proc_.exe_path.is_empty() {
-            failed_items.push(format!("{}: no executable path recorded", display_name(proc_)));
+            failed_items.push(format!(
+                "{}: no executable path recorded",
+                display_name(proc_)
+            ));
             continue;
         }
 
         let cat = Category::from_str(&proc_.classification);
         // Detect browsers by exe too — a *foreground* browser is classified "foreground".
-        let is_browser_proc = cat.is_browser() || classify::classify(&proc_.exe_path, true).is_browser();
+        let is_browser_proc =
+            cat.is_browser() || classify::classify(&proc_.exe_path, true).is_browser();
         // Browsers: reopen the exact tabs captured at snapshot time (the active tab of
         // each window, via `browser_tab` hints) rather than the session-dependent
         // Ctrl+Shift+T trick. All captured URLs open as tabs in one launch. With no
@@ -103,8 +111,8 @@ pub fn restore_desktop(
         let is_terminal_proc = cat == Category::Terminal
             || classify::classify(&proc_.exe_path, true) == Category::Terminal;
 
-        let launch_cmd = if is_browser_proc {
-            if companion_managed_browsers {
+        let (launch_exe, launch_cmd) = if is_browser_proc {
+            let cmd = if companion_managed_browsers {
                 String::new()
             } else {
                 let urls = browser_urls_for(snapshot, &exe_stem(&proc_.exe_path));
@@ -114,12 +122,14 @@ pub fn restore_desktop(
                     let quoted: Vec<String> = urls.iter().map(|u| format!("\"{u}\"")).collect();
                     format!("\"{}\" {}", proc_.exe_path, quoted.join(" "))
                 }
-            }
+            };
+            (proc_.exe_path.clone(), cmd)
         } else if is_terminal_proc {
-            terminal_restore_cmd(snapshot, proc_, &mut terminal_index, None)
-                .unwrap_or_else(|| proc_.cmd_line.clone())
+            terminal_restore_cmd(snapshot, proc_, &mut terminal_indices, None)
+                .map(|command| (command.exe_path, command.cmd_line))
+                .unwrap_or_else(|| (proc_.exe_path.clone(), proc_.cmd_line.clone()))
         } else {
-            proc_.cmd_line.clone()
+            (proc_.exe_path.clone(), proc_.cmd_line.clone())
         };
 
         // Communication apps (Teams, Slack, …) are tray-resident: the user may have
@@ -128,7 +138,7 @@ pub fn restore_desktop(
         // (is_running was true → they're already in `running`, not in launch_list,
         //  but if somehow they are here, just launch normally.)
 
-        match launch(&proc_.exe_path, &launch_cmd, &proc_.classification) {
+        match launch(&launch_exe, &launch_cmd, &proc_.classification) {
             Ok(()) => {
                 // Multi-window restore: if this process had more than one window in
                 // the snapshot, launch it again for each additional window.
@@ -139,7 +149,11 @@ pub fn restore_desktop(
                 //
                 // Skip browsers (tabs are restored via captured URLs above) and
                 // communication apps (single-instance with their own multi-window model).
-                if !is_browser_proc && !cat.is_communication() {
+                let exe_key = proc_.exe_path.to_ascii_lowercase();
+                if !is_browser_proc
+                    && !cat.is_communication()
+                    && extra_window_exes_handled.insert(exe_key)
+                {
                     let snap_count = snapshot
                         .windows
                         .iter()
@@ -155,12 +169,22 @@ pub fn restore_desktop(
                         .get(&proc_.exe_path.to_ascii_lowercase())
                         .copied()
                         .unwrap_or(0);
-                    let extra_windows = snap_count.saturating_sub(pre_live + 1);
+                    let planned_launches = launch_list
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.exe_path.eq_ignore_ascii_case(&proc_.exe_path)
+                        })
+                        .count();
+                    let extra_windows =
+                        extra_window_launch_count(snap_count, pre_live, planned_launches);
 
                     if extra_windows > 0 {
                         // Collect office_extra_file hints for this exe stem.
-                        let hint_prefix = format!("office_extra_file:{}:", exe_stem(&proc_.exe_path));
-                        let extra_files: Vec<String> = snapshot.restore_hints.iter()
+                        let hint_prefix =
+                            format!("office_extra_file:{}:", exe_stem(&proc_.exe_path));
+                        let extra_files: Vec<String> = snapshot
+                            .restore_hints
+                            .iter()
                             .filter_map(|h| h.strip_prefix(&hint_prefix).map(|s| s.to_string()))
                             .collect();
 
@@ -222,13 +246,18 @@ pub fn restore_desktop(
                 let is_terminal = Category::from_str(&proc_.classification) == Category::Terminal
                     || classify::classify(&proc_.exe_path, true) == Category::Terminal;
                 // Skip browsers (handled separately) and terminals (handled below).
-                if is_browser || Category::from_str(&proc_.classification).is_communication() || is_terminal {
+                if is_browser
+                    || Category::from_str(&proc_.classification).is_communication()
+                    || is_terminal
+                    || is_vscode_family(&proc_.exe_path)
+                {
                     continue;
                 }
 
                 let deficit = snap_count - pre_live;
                 for i in 0..deficit {
-                    if let Err(e) = launch(&proc_.exe_path, &proc_.cmd_line, &proc_.classification) {
+                    if let Err(e) = launch(&proc_.exe_path, &proc_.cmd_line, &proc_.classification)
+                    {
                         failed_items.push(format!(
                             "{}: extra window {} failed ({e})",
                             display_name(proc_),
@@ -307,14 +336,17 @@ pub fn restore_desktop(
 
             // One-to-one title match: for each snapshot terminal window find the best
             // live terminal window. Each live window can only be claimed once.
-            let mut claimed_live: std::collections::HashSet<isize> = std::collections::HashSet::new();
-            let mut matched_snap: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            let mut claimed_live: std::collections::HashSet<isize> =
+                std::collections::HashSet::new();
+            let mut matched_snap: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
 
             for (si, sw) in snap_terminal_windows.iter().enumerate() {
                 // Exact match first.
-                if let Some(lw) = live_term_wins.iter().find(|lw| {
-                    !claimed_live.contains(&lw.hwnd) && lw.title == sw.title
-                }) {
+                if let Some(lw) = live_term_wins
+                    .iter()
+                    .find(|lw| !claimed_live.contains(&lw.hwnd) && lw.title == sw.title)
+                {
                     claimed_live.insert(lw.hwnd);
                     matched_snap.insert(si);
                     continue;
@@ -338,20 +370,33 @@ pub fn restore_desktop(
             // documented as clean-restore-only).
             if close_others {
                 let protected_pids = self_and_ancestor_pids();
-                let mut any_closed = false;
+                let mut requested: Vec<(isize, u32, String)> = vec![];
                 for lw in &live_term_wins {
                     if !claimed_live.contains(&lw.hwnd) && !protected_pids.contains(&lw.pid) {
                         let hwnd = HWND(lw.hwnd as *mut core::ffi::c_void);
-                        let posted = unsafe { PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) };
-                        if posted.is_ok() {
-                            any_closed = true;
-                            term_closed.push(format!("'{}' ({})", lw.title, exe_stem(&lw.exe)));
+                        if unsafe { PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) }.is_ok() {
+                            requested.push((
+                                lw.hwnd,
+                                lw.pid,
+                                format!("'{}' ({})", lw.title, exe_stem(&lw.exe)),
+                            ));
                         }
                     }
                 }
-                // Brief grace period for WM_CLOSE to process before we launch new windows.
-                if any_closed {
-                    std::thread::sleep(Duration::from_millis(600));
+                // Grace period for WM_CLOSE, then force-close any that stalled on a
+                // save prompt — only report the ones that actually went away.
+                if !requested.is_empty() {
+                    let closing: std::collections::HashSet<isize> =
+                        requested.iter().map(|(h, _, _)| *h).collect();
+                    let requested_hp: Vec<(isize, u32)> =
+                        requested.iter().map(|(h, p, _)| (*h, *p)).collect();
+                    let still_open =
+                        force_close_stragglers(&requested_hp, &closing, &protected_pids, 600);
+                    for (hwnd, _pid, label) in requested {
+                        if !still_open.contains(&hwnd) {
+                            term_closed.push(label);
+                        }
+                    }
                 }
             }
 
@@ -368,9 +413,12 @@ pub fn restore_desktop(
                     if crate::config::is_ignored(&exe_stem(&proc_.exe_path), ignore_list) {
                         continue;
                     }
-                    let cmd = terminal_restore_cmd(snapshot, proc_, &mut terminal_index, Some(&sw.title))
-                        .unwrap_or_else(|| proc_.cmd_line.clone());
-                    if let Err(e) = launch(&proc_.exe_path, &cmd, &proc_.classification) {
+                    let command =
+                        terminal_restore_cmd(snapshot, proc_, &mut terminal_indices, Some(&sw.title));
+                    let (launch_exe, cmd) = command
+                        .map(|command| (command.exe_path, command.cmd_line))
+                        .unwrap_or_else(|| (proc_.exe_path.clone(), proc_.cmd_line.clone()));
+                    if let Err(e) = launch(&launch_exe, &cmd, &proc_.classification) {
                         failed_items.push(format!(
                             "{}: terminal window {} failed to launch ({e})",
                             display_name(proc_),
@@ -382,13 +430,98 @@ pub fn restore_desktop(
         }
     }
 
+    let mut vscode_closed: Vec<String> = vec![];
+    {
+        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+        let targets: Vec<&str> = snapshot
+            .restore_hints
+            .iter()
+            .filter_map(|h| h.strip_prefix("vscode_folder:"))
+            .collect();
+        let live: Vec<&LiveWindow> = pre_launch_wins
+            .iter()
+            .filter(|w| is_vscode_family(&w.exe))
+            .collect();
+        let mut claimed = std::collections::HashSet::new();
+        let mut matched = std::collections::HashSet::new();
+        for (i, path) in targets.iter().enumerate() {
+            let name = std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_ascii_lowercase());
+            if let Some(w) = live.iter().find(|w| {
+                !claimed.contains(&w.hwnd)
+                    && crate::context::vscode_folder_from_title(&w.title)
+                        .map(|n| Some(n.to_ascii_lowercase()) == name)
+                        .unwrap_or(false)
+            }) {
+                claimed.insert(w.hwnd);
+                matched.insert(i);
+            }
+        }
+        if close_others {
+            let protected = self_and_ancestor_pids();
+            let mut requested: Vec<(isize, u32, String)> = vec![];
+            for w in &live {
+                if !claimed.contains(&w.hwnd) && !protected.contains(&w.pid) {
+                    let hwnd = HWND(w.hwnd as *mut core::ffi::c_void);
+                    if unsafe { PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) }.is_ok() {
+                        requested.push((
+                            w.hwnd,
+                            w.pid,
+                            format!("'{}' ({})", w.title, exe_stem(&w.exe)),
+                        ));
+                    }
+                }
+            }
+            // A multi-window editor usually shares one process, so the collateral
+            // guard in force_close_stragglers will decline to kill when a kept
+            // window shares the PID — safe, and reported honestly as not-closed.
+            if !requested.is_empty() {
+                let closing: std::collections::HashSet<isize> =
+                    requested.iter().map(|(h, _, _)| *h).collect();
+                let requested_hp: Vec<(isize, u32)> =
+                    requested.iter().map(|(h, p, _)| (*h, *p)).collect();
+                let still_open =
+                    force_close_stragglers(&requested_hp, &closing, &protected, 800);
+                for (hwnd, _pid, label) in requested {
+                    if !still_open.contains(&hwnd) {
+                        vscode_closed.push(label);
+                    }
+                }
+            }
+        }
+        if let Some(proc_) = snapshot
+            .processes
+            .iter()
+            .find(|p| is_vscode_family(&p.exe_path))
+        {
+            for (i, path) in targets.iter().enumerate() {
+                if !matched.contains(&i) {
+                    let cmd = format!("\"{}\" \"{}\"", proc_.exe_path, path);
+                    if let Err(e) = launch(&proc_.exe_path, &cmd, "ide") {
+                        failed_items.push(format!(
+                            "{}: folder '{}' failed to launch ({e})",
+                            display_name(proc_),
+                            path
+                        ));
+                    }
+                }
+            }
+        }
+    }
     // Communication apps that are tray-resident (is_running == true, so they were
     // skipped from launch_list): find their saved windows and restore them from tray.
     for proc_ in snapshot.processes.iter() {
         if !Category::from_str(&proc_.classification).is_communication() {
             continue;
         }
-        if running.get(&proc_.exe_path.to_ascii_lowercase()).copied().unwrap_or(0) == 0 {
+        if running
+            .get(&proc_.exe_path.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(0)
+            == 0
+        {
             continue; // not running → it will be handled by the normal launch_list above
         }
         // Already running in the tray — just bring its window forward via ShowWindow.
@@ -396,9 +529,11 @@ pub fn restore_desktop(
         // it matches by title. Nudge it by posting a "restore from tray" signal via
         // the window's taskbar button (best-effort, no crash if it fails).
         let live = live_windows();
-        for win in snapshot.windows.iter().filter(|w| {
-            !w.exe_path.is_empty() && w.exe_path.eq_ignore_ascii_case(&proc_.exe_path)
-        }) {
+        for win in snapshot
+            .windows
+            .iter()
+            .filter(|w| !w.exe_path.is_empty() && w.exe_path.eq_ignore_ascii_case(&proc_.exe_path))
+        {
             if let Some(hwnd) = match_window(&live, &win.title) {
                 focus_window(hwnd);
             }
@@ -418,9 +553,13 @@ pub fn restore_desktop(
     // The deadline is generous (capture must be <3s, but restore has no such budget):
     // Electron/JVM apps like Teams and Opera routinely take several seconds to show a
     // window, and a too-short deadline was the main reason so many windows were skipped.
-    let mut pending: Vec<&WindowInfo> = snapshot.windows.iter().filter(|window| {
-        !companion_managed_browsers || !classify::classify(&window.exe_path, true).is_browser()
-    }).collect();
+    let mut pending: Vec<&WindowInfo> = snapshot
+        .windows
+        .iter()
+        .filter(|window| {
+            !companion_managed_browsers || !classify::classify(&window.exe_path, true).is_browser()
+        })
+        .collect();
     let mut consumed: HashSet<isize> = HashSet::new();
     let deadline = Instant::now() + Duration::from_millis(8000);
     while !pending.is_empty() && Instant::now() < deadline {
@@ -461,12 +600,10 @@ pub fn restore_desktop(
     // ── 4. Optional clean-up: close windows that aren't part of this snapshot ──────────
     // Terminals closed during reconciliation (clean restore only) are reported too.
     let mut closed_items = term_closed;
+    closed_items.extend(vscode_closed);
     if close_others {
-        let (closed, leftover) = close_windows_not_in_snapshot(
-            snapshot,
-            ignore_list,
-            companion_managed_browsers,
-        );
+        let (closed, leftover) =
+            close_windows_not_in_snapshot(snapshot, ignore_list, companion_managed_browsers);
         // Windows that wouldn't close are surfaced honestly as warnings.
         warnings.extend(leftover);
         closed_items.extend(closed);
@@ -490,7 +627,10 @@ fn finalize(
         .find(|p| p.classification == "foreground")
     {
         let live = live_windows();
-        if let Some(w) = live.iter().find(|w| exe_stem(&w.exe) == exe_stem(&fg.exe_path)) {
+        if let Some(w) = live
+            .iter()
+            .find(|w| exe_stem(&w.exe) == exe_stem(&fg.exe_path))
+        {
             focus_window(w.hwnd);
         }
     }
@@ -535,7 +675,11 @@ fn build_message(failed: &[String], warnings: &[String], closed: &[String]) -> S
 /// Human-readable reason a saved window could not be repositioned.
 #[cfg(windows)]
 fn unplaced_reason(w: &WindowInfo) -> String {
-    let title = if w.title.is_empty() { "(untitled window)" } else { &w.title };
+    let title = if w.title.is_empty() {
+        "(untitled window)"
+    } else {
+        &w.title
+    };
     let app = exe_stem(&w.exe_path);
     if app == "explorer" {
         // File Explorer windows are owned by the always-running shell; we never relaunch
@@ -561,8 +705,18 @@ fn display_name(p: &crate::ProcessInfo) -> String {
     }
 }
 
+fn is_vscode_family(exe_path: &str) -> bool {
+    matches!(
+        exe_stem(exe_path).as_str(),
+        "code" | "code-insiders" | "cursor"
+    )
+}
+
 fn exe_stem(exe_path: &str) -> String {
-    let last = exe_path.rsplit(|c| c == '\\' || c == '/').next().unwrap_or(exe_path);
+    let last = exe_path
+        .rsplit(|c| c == '\\' || c == '/')
+        .next()
+        .unwrap_or(exe_path);
     last.strip_suffix(".exe")
         .or_else(|| last.strip_suffix(".EXE"))
         .unwrap_or(last)
@@ -643,7 +797,8 @@ struct LiveWindow {
 fn live_windows() -> Vec<LiveWindow> {
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+        EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+        IsWindowVisible,
     };
 
     unsafe extern "system" fn cb(hwnd: HWND, data: LPARAM) -> BOOL {
@@ -769,11 +924,12 @@ fn match_window_by_exe(
 
 #[cfg(windows)]
 fn exe_path_for_pid(pid: u32) -> String {
+    use windows::core::PWSTR;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
     };
-    use windows::core::PWSTR;
 
     if pid == 0 {
         return String::new();
@@ -813,7 +969,8 @@ fn running_exe_paths_counted() -> std::collections::HashMap<String, usize> {
     let mut map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for p in sys.processes().values() {
         if let Some(exe) = p.exe() {
-            *map.entry(exe.to_string_lossy().to_ascii_lowercase()).or_insert(0) += 1;
+            *map.entry(exe.to_string_lossy().to_ascii_lowercase())
+                .or_insert(0) += 1;
         }
     }
     map
@@ -868,13 +1025,32 @@ fn focus_window(hwnd_raw: isize) {
     }
 }
 
+/// Bring a visible window owned by `exe_path` to the foreground after a
+/// selective restore. Selecting one app is an explicit request to surface it.
+#[cfg(windows)]
+pub fn focus_app(exe_path: &str) {
+    if let Some(window) = live_windows()
+        .into_iter()
+        .find(|window| window.exe.eq_ignore_ascii_case(exe_path))
+    {
+        focus_window(window.hwnd);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn focus_app(_exe_path: &str) {}
+
 /// Close every visible window whose owning executable is NOT part of `snapshot`.
 ///
-/// Uses WM_CLOSE — exactly what clicking the title-bar X does — so apps with unsaved
-/// work get the chance to raise their own "Save changes?" prompt. Nothing is ever
-/// force-killed (consistent with the non-destructive macro-layer rule). Returns
-/// `(closed, leftover)`: windows that actually closed, and those that ignored the
-/// request within a short grace period so they can be reported honestly.
+/// Two-stage close. First sends WM_CLOSE — exactly what clicking the title-bar X
+/// does — giving each app a brief chance to shut down cleanly. After a grace
+/// period, any *targeted* window still alive is blocked (a "Save changes?" /
+/// "Close all tabs?" dialog, or an app ignoring WM_CLOSE) and would otherwise
+/// stall Start Fresh / clean Restore, so its owning process is force-terminated —
+/// discarding unsaved work in that app. To avoid collateral, a PID is only killed
+/// when *every* one of its still-live windows was a close target; a process that
+/// also owns a window we're keeping is left alone and reported as leftover.
+/// Returns `(closed, leftover)` so both outcomes can be reported honestly.
 #[cfg(windows)]
 fn close_windows_not_in_snapshot(
     snapshot: &Snapshot,
@@ -882,7 +1058,6 @@ fn close_windows_not_in_snapshot(
     companion_managed_browsers: bool,
 ) -> (Vec<String>, Vec<String>) {
     use std::collections::{HashMap, HashSet};
-    use std::time::Duration;
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
 
@@ -951,7 +1126,7 @@ fn close_windows_not_in_snapshot(
         // Terminals are reconciled/closed by the dedicated terminal pass earlier
         // in the restore; leave them to it so the two passes can't double-close
         // or double-report the same window.
-        if classify::classify(stem, true) == Category::Terminal {
+        if classify::classify(stem, true) == Category::Terminal || is_vscode_family(stem) {
             continue;
         }
         if companion_managed_browsers && classify::classify(stem, true).is_browser() {
@@ -960,9 +1135,7 @@ fn close_windows_not_in_snapshot(
         let live_of: Vec<&LiveWindow> = live
             .iter()
             .filter(|w| {
-                !w.exe.is_empty()
-                    && exe_stem(&w.exe) == *stem
-                    && !protected_pids.contains(&w.pid)
+                !w.exe.is_empty() && exe_stem(&w.exe) == *stem && !protected_pids.contains(&w.pid)
             })
             .collect();
         let live_titles: Vec<String> = live_of.iter().map(|w| w.title.clone()).collect();
@@ -979,8 +1152,9 @@ fn close_windows_not_in_snapshot(
         return (vec![], vec![]);
     }
 
-    // hwnd, display label
-    let mut requested: Vec<(isize, String)> = vec![];
+    // hwnd, pid, display label
+    let target_hwnds: HashSet<isize> = targets.iter().map(|w| w.hwnd).collect();
+    let mut requested: Vec<(isize, u32, String)> = vec![];
     for w in &targets {
         let label = if w.title.is_empty() {
             format!("({})", exe_stem(&w.exe))
@@ -990,25 +1164,115 @@ fn close_windows_not_in_snapshot(
         let hwnd = HWND(w.hwnd as *mut core::ffi::c_void);
         let posted = unsafe { PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) };
         if posted.is_ok() {
-            requested.push((w.hwnd, label));
+            requested.push((w.hwnd, w.pid, label));
         }
     }
 
-    // Give apps a moment to close (or to raise a save prompt).
-    std::thread::sleep(Duration::from_millis(1500));
+    // Wait for clean exits, then force-terminate whatever's still blocked on a
+    // save/confirm dialog. `target_hwnds` is the full set we asked to close, so
+    // the helper's collateral guard never kills a process that also owns a kept
+    // window.
+    let requested_hp: Vec<(isize, u32)> = requested.iter().map(|(h, p, _)| (*h, *p)).collect();
+    let still_open = force_close_stragglers(&requested_hp, &target_hwnds, &protected_pids, 1500);
 
-    let still_live = live_windows();
     let mut closed: Vec<String> = vec![];
     let mut leftover: Vec<String> = vec![];
-    for (hwnd, label) in requested {
-        if still_live.iter().any(|w| w.hwnd == hwnd) {
-            leftover.push(format!("{label} — still open (it may be asking to save, or refused to close)"));
+    for (hwnd, _pid, label) in requested {
+        if still_open.contains(&hwnd) {
+            leftover.push(format!(
+                "{label} — still open (refused to close, and could not be force-closed safely)"
+            ));
         } else {
             closed.push(label);
         }
     }
     (closed, leftover)
 }
+
+/// After a batch of windows have been sent WM_CLOSE, wait `grace_ms` for clean
+/// exits, then force-terminate the process behind any that are still up — so a
+/// blocking "Save changes?" / "Close all tabs?" dialog can't stall Start Fresh
+/// or a clean Restore. A PID is only killed when *every* one of its still-live
+/// windows is in `closing`, so a process that also owns a window we're keeping
+/// (e.g. a single-process editor with one kept and one surplus window) is left
+/// intact. `protected` PIDs (our own process tree) are never touched. Returns
+/// the subset of `requested` hwnds that remain open after the whole attempt.
+#[cfg(windows)]
+fn force_close_stragglers(
+    requested: &[(isize, u32)],
+    closing: &std::collections::HashSet<isize>,
+    protected: &std::collections::HashSet<u32>,
+    grace_ms: u64,
+) -> std::collections::HashSet<isize> {
+    use std::collections::{HashMap, HashSet};
+    use std::time::Duration;
+
+    std::thread::sleep(Duration::from_millis(grace_ms));
+    let still = live_windows();
+
+    let mut live_by_pid: HashMap<u32, Vec<isize>> = HashMap::new();
+    for w in &still {
+        live_by_pid.entry(w.pid).or_default().push(w.hwnd);
+    }
+
+    let mut handled: HashSet<u32> = HashSet::new();
+    let mut killed_any = false;
+    for (hwnd, pid) in requested {
+        if handled.contains(pid) || protected.contains(pid) {
+            continue;
+        }
+        if !still.iter().any(|w| w.hwnd == *hwnd) {
+            continue; // closed cleanly on its own
+        }
+        let pid_windows = live_by_pid.get(pid).map(Vec::as_slice).unwrap_or(&[]);
+        if pid_windows.iter().all(|h| closing.contains(h)) && terminate_pid(*pid) {
+            handled.insert(*pid);
+            killed_any = true;
+        }
+    }
+
+    // Let terminated processes tear down before the honest recount.
+    if killed_any {
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    let final_live = if killed_any { live_windows() } else { still };
+    requested
+        .iter()
+        .map(|(h, _)| *h)
+        .filter(|h| final_live.iter().any(|w| w.hwnd == *h))
+        .collect()
+}
+
+/// Force-terminate a process by PID. Best-effort: returns whether the kill
+/// request succeeded. Used only to clear a window blocking Start Fresh / clean
+/// Restore after a graceful WM_CLOSE was ignored — this discards unsaved work.
+#[cfg(windows)]
+fn terminate_pid(pid: u32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    unsafe {
+        let handle = match OpenProcess(PROCESS_TERMINATE, false, pid) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+        let ok = TerminateProcess(handle, 1).is_ok();
+        let _ = CloseHandle(handle);
+        ok
+    }
+}
+
+/// Gracefully close every non-protected user window for the Start new action.
+pub fn close_all_windows(ignore_list: &[String]) -> (Vec<String>, Vec<String>) {
+    let empty = Snapshot {
+        schema_version: 2, id: String::new(), name: String::new(), timestamp: String::new(),
+        processes: vec![], windows: vec![], context_clues: vec![], restore_hints: vec![],
+        warnings: vec![], thumbnail_path: String::new(), terminal_sessions: vec![], browser_sessions: vec![],
+    };
+    close_windows_not_in_snapshot(&empty, ignore_list, false)
+}
+
+#[cfg(not(windows))]
+pub fn close_all_windows(_ignore_list: &[String]) -> (Vec<String>, Vec<String>) { (vec![], vec![]) }
 
 /// Which live windows of an in-snapshot app to close as surplus. Keeps
 /// `snap_titles.len()` windows, preferring ones whose title matches a saved
@@ -1023,7 +1287,13 @@ fn surplus_close_indices(snap_titles: &[String], live_titles: &[String]) -> Vec<
     // Matched windows sort first (kept); unmatched last (closed). Stable sort
     // keeps the surplus deterministic.
     let mut order: Vec<usize> = (0..live_titles.len()).collect();
-    order.sort_by_key(|&i| if title_matches_any(&live_titles[i], snap_titles) { 0 } else { 1 });
+    order.sort_by_key(|&i| {
+        if title_matches_any(&live_titles[i], snap_titles) {
+            0
+        } else {
+            1
+        }
+    });
     order.into_iter().skip(snap_count).collect()
 }
 
@@ -1043,6 +1313,15 @@ fn title_matches_any(title: &str, snap_titles: &[String]) -> bool {
     })
 }
 
+#[cfg(windows)]
+fn extra_window_launch_count(
+    snapshot_windows: usize,
+    live_windows: usize,
+    planned_process_launches: usize,
+) -> usize {
+    snapshot_windows.saturating_sub(live_windows + planned_process_launches)
+}
+
 /// Build a restore-aware launch command for a terminal process by matching it
 /// to a saved `TerminalSession`. Writes a temp restore script so the terminal
 /// opens at the right CWD and shows recent command history.
@@ -1051,12 +1330,13 @@ fn title_matches_any(title: &str, snap_titles: &[String]) -> bool {
 /// `window_title` — the snapshot window title to use for best-match session selection.
 ///                  Pass `None` to fall back to sequential index order.
 /// `index`        — bumped on each call so successive calls pick different sessions.
+/// Session cursors are keyed by executable so mixed terminal types advance independently.
 fn terminal_restore_cmd(
     snapshot: &Snapshot,
     proc_: &crate::ProcessInfo,
-    index: &mut usize,
+    indices: &mut std::collections::HashMap<String, usize>,
     window_title: Option<&str>,
-) -> Option<String> {
+) -> Option<crate::terminal::TerminalLaunch> {
     if snapshot.terminal_sessions.is_empty() {
         return None;
     }
@@ -1065,21 +1345,15 @@ fn terminal_restore_cmd(
         .terminal_sessions
         .iter()
         .enumerate()
-        .filter(|(_, s)| {
-            let shell_exe = match s.shell.as_str() {
-                "powershell" => "powershell",
-                "pwsh" => "pwsh",
-                "cmd" => "cmd",
-                "windows_terminal" => "windowsterminal",
-                _ => "",
-            };
-            !shell_exe.is_empty() && exe_stem(&proc_.exe_path) == shell_exe
-        })
+        .filter(|(_, s)| crate::terminal::session_matches_executable(s, &proc_.exe_path))
         .collect();
 
     if sessions_for_exe.is_empty() {
         return None;
     }
+    let index = indices
+        .entry(proc_.exe_path.to_ascii_lowercase())
+        .or_insert(0);
 
     // Try to match by window title first (exact, then substring).
     let session = if let Some(title) = window_title.filter(|t| !t.is_empty()) {
@@ -1090,7 +1364,8 @@ fn terminal_restore_cmd(
                 sessions_for_exe.iter().find(|(_, s)| {
                     s.window_title.len() >= 4
                         && title.len() >= 4
-                        && (s.window_title.contains(title) || title.contains(s.window_title.as_str()))
+                        && (s.window_title.contains(title)
+                            || title.contains(s.window_title.as_str()))
                 })
             })
             .map(|(_, s)| *s)
@@ -1129,7 +1404,9 @@ fn browser_urls_for(snapshot: &Snapshot, stem: &str) -> Vec<String> {
 
 #[cfg(all(windows, test))]
 mod tests {
-    use super::surplus_close_indices;
+    use super::{extra_window_launch_count, surplus_close_indices, terminal_restore_cmd};
+    use crate::{ProcessInfo, Snapshot, TerminalSession};
+    use std::collections::HashMap;
 
     fn v(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -1167,6 +1444,74 @@ mod tests {
         let snap = v(&["Win A", "Win B"]);
         let live = v(&["Win A", "Win B", "Extra"]);
         assert_eq!(surplus_close_indices(&snap, &live), vec![2]);
+    }
+
+    #[test]
+    fn process_per_window_terminals_do_not_get_extra_blank_launches() {
+        assert_eq!(extra_window_launch_count(3, 0, 3), 0);
+        assert_eq!(extra_window_launch_count(3, 1, 2), 0);
+        assert_eq!(extra_window_launch_count(3, 0, 1), 2);
+    }
+
+    #[test]
+    fn mixed_terminal_types_advance_independent_session_cursors() {
+        let root = std::env::temp_dir()
+            .join("pc_snapshot_mixed_terminal_test")
+            .join(std::process::id().to_string());
+        let mintty = root.join("usr").join("bin").join("mintty.exe");
+        let git_bash = root.join("git-bash.exe");
+        std::fs::create_dir_all(mintty.parent().unwrap()).unwrap();
+        std::fs::write(&mintty, []).unwrap();
+        std::fs::write(&git_bash, []).unwrap();
+
+        let powershell = ProcessInfo {
+            name: "PowerShell".to_string(),
+            pid: 1,
+            exe_path: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+            cmd_line: "powershell.exe".to_string(),
+            classification: "terminal".to_string(),
+        };
+        let git = ProcessInfo {
+            name: "Git Bash".to_string(),
+            pid: 2,
+            exe_path: mintty.to_string_lossy().into_owned(),
+            cmd_line: "mintty.exe".to_string(),
+            classification: "terminal".to_string(),
+        };
+        let snapshot = Snapshot {
+            schema_version: 2,
+            id: "mixed".to_string(),
+            name: "mixed".to_string(),
+            timestamp: String::new(),
+            processes: vec![powershell.clone(), git.clone()],
+            windows: vec![],
+            context_clues: vec![],
+            restore_hints: vec![],
+            warnings: vec![],
+            thumbnail_path: String::new(),
+            terminal_sessions: vec![
+                TerminalSession {
+                    shell: "powershell".to_string(),
+                    cwd: r"C:\Windows".to_string(),
+                    history: vec![],
+                    window_title: "Windows PowerShell".to_string(),
+                },
+                TerminalSession {
+                    shell: "git_bash".to_string(),
+                    cwd: r"C:\repo".to_string(),
+                    history: vec![],
+                    window_title: "MINGW64:/c/repo".to_string(),
+                },
+            ],
+            browser_sessions: vec![],
+        };
+
+        let mut cursors = HashMap::new();
+        assert!(terminal_restore_cmd(&snapshot, &powershell, &mut cursors, None).is_some());
+        let git_launch = terminal_restore_cmd(&snapshot, &git, &mut cursors, None).unwrap();
+        assert_eq!(git_launch.exe_path, git_bash.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

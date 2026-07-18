@@ -1,6 +1,7 @@
 //! Terminal session capture & restore — reads PSReadLine history, maps it to
 //! terminal windows, and generates restore scripts that `cd` to the saved CWD
 //! and display recent command history for context.
+//! Git Bash sessions use their own `.bash_history` source and launcher.
 //!
 //! CWD source: we locate the shell process that actually backs each terminal
 //! window and read its real working directory straight from that process's PEB
@@ -10,9 +11,9 @@
 //! decide"). Title/`-d` parsing remains only as a last-resort fallback.
 //!
 //! Limitations:
-//!   - PSReadLine history is global (one file for all sessions), so we cannot
-//!     attribute specific commands to specific windows. Each restored terminal
-//!     shows the same recent-history block.
+//!   - PSReadLine and Git Bash history files are global, so we cannot attribute
+//!     specific commands to specific windows. Each shell type shows its own
+//!     recent-history block.
 //!   - One Windows Terminal process hosts many tabs/windows with no exposed
 //!     window→shell mapping; we assign its shells to its windows by ascending
 //!     PID, which is exact for the common single-terminal case but best-effort
@@ -37,7 +38,6 @@ pub fn capture_terminal_sessions(
     processes: &[ProcessInfo],
     windows: &[(u32, WindowInfo)],
 ) -> Vec<TerminalSession> {
-    let history = read_psreadline_history();
     let mut sessions = Vec::new();
 
     // Built once, on the first terminal window: a process-tree snapshot used to
@@ -60,6 +60,7 @@ pub fn capture_terminal_sessions(
         }
 
         let shell = shell_type(&proc_.exe_path);
+        let history = read_terminal_history(shell);
 
         // Resolution order, best → worst:
         //   1. Window title, when it holds an absolute path. This is the ONLY
@@ -364,12 +365,16 @@ fn shell_type(exe_path: &str) -> &'static str {
         "pwsh" => "pwsh",
         "cmd" => "cmd",
         "windowsterminal" | "wt" => "windows_terminal",
+        "mintty" if git_bash_launcher_path(exe_path).is_some() => "git_bash",
         _ => "unknown",
     }
 }
 
 fn cwd_from_title(title: &str) -> Option<String> {
     let t = title.trim();
+    if let Some(cwd) = git_bash_cwd_from_title(t) {
+        return Some(cwd);
+    }
     if matches!(
         t,
         "Windows PowerShell"
@@ -399,6 +404,46 @@ fn cwd_from_title(title: &str) -> Option<String> {
         if let Ok(home) = std::env::var("USERPROFILE") {
             return Some(t.replacen('~', &home, 1));
         }
+    }
+    None
+}
+
+/// Git for Windows' mintty title is normally `<MSYSTEM>:<POSIX cwd>`, for
+/// example `MINGW64:/c/Users/me/project`. Convert it back to a Windows path.
+fn git_bash_cwd_from_title(title: &str) -> Option<String> {
+    let (environment, path) = title.trim().split_once(':')?;
+    if !matches!(
+        environment.to_ascii_uppercase().as_str(),
+        "MSYS" | "MINGW32" | "MINGW64" | "UCRT64" | "CLANG32" | "CLANG64" | "CLANGARM64"
+    ) {
+        return None;
+    }
+
+    let path = path.trim();
+    if path == "~" || path.starts_with("~/") {
+        let home = std::env::var("USERPROFILE").ok()?;
+        let suffix = path.strip_prefix('~').unwrap_or_default();
+        let separator = std::path::MAIN_SEPARATOR.to_string();
+        return Some(format!("{home}{}", suffix.replace('/', &separator)));
+    }
+
+    let bytes = path.as_bytes();
+    if path.starts_with("//") {
+        let separator = std::path::MAIN_SEPARATOR.to_string();
+        return Some(path.replace('/', &separator));
+    }
+    if bytes.len() >= 2
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && (bytes.len() == 2 || bytes.get(2) == Some(&b'/'))
+    {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        let separator = std::path::MAIN_SEPARATOR.to_string();
+        let suffix = match path.get(2..).unwrap_or_default() {
+            "" => separator,
+            suffix => suffix.replace('/', &separator),
+        };
+        return Some(format!("{drive}:{suffix}"));
     }
     None
 }
@@ -443,18 +488,50 @@ fn read_psreadline_history() -> Vec<String> {
     lines[start..].to_vec()
 }
 
+#[cfg(windows)]
+fn read_terminal_history(shell: &str) -> Vec<String> {
+    if shell != "git_bash" {
+        return read_psreadline_history();
+    }
+
+    let home = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        Ok(path) => path,
+        Err(_) => return vec![],
+    };
+    read_history_tail(&std::path::PathBuf::from(home).join(".bash_history"))
+}
+
+#[cfg(windows)]
+fn read_history_tail(path: &std::path::Path) -> Vec<String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return vec![],
+    };
+    let content = String::from_utf8_lossy(&bytes);
+    let lines: Vec<String> = content.lines().map(str::to_string).collect();
+    let start = lines.len().saturating_sub(MAX_HISTORY_LINES);
+    lines[start..].to_vec()
+}
+
 // ── Restore ─────────────────────────────────────────────────────────────────
 
 /// Build the launch command for a terminal process using its saved session.
 /// Returns `None` to fall back to the raw cmd_line.
+#[cfg(windows)]
+pub struct TerminalLaunch {
+    pub exe_path: String,
+    pub cmd_line: String,
+}
+
 #[cfg(windows)]
 pub fn terminal_launch_cmd(
     exe_path: &str,
     session: &TerminalSession,
     temp_dir: &std::path::Path,
     index: usize,
-) -> Option<String> {
-    match session.shell.as_str() {
+) -> Option<TerminalLaunch> {
+    let shell = effective_shell(session, exe_path);
+    let cmd_line = match shell {
         "powershell" | "pwsh" => {
             let script_path = temp_dir.join(format!("restore_terminal_{index}.ps1"));
             let script = build_ps_restore_script(session);
@@ -483,13 +560,212 @@ pub fn terminal_launch_cmd(
                 Some(format!("\"{}\" -d \"{}\"", exe_path, session.cwd))
             }
         }
+        "git_bash" => {
+            let launcher = git_bash_launcher_path(exe_path)?;
+            let cwd = if session.cwd.is_empty() {
+                git_bash_cwd_from_title(&session.window_title)
+            } else {
+                Some(session.cwd.clone())
+            };
+            let arg = cwd
+                .map(|cwd| format!("--cd={cwd}"))
+                .unwrap_or_else(|| "--cd-to-home".to_string());
+            let history_args = if session.history.is_empty() {
+                String::new()
+            } else {
+                let history_path = temp_dir.join(format!("restore_git_bash_{index}.history"));
+                let script_path = temp_dir.join(format!("restore_git_bash_{index}.sh"));
+                std::fs::write(&history_path, session.history.join("\n")).ok()?;
+                let script = build_bash_restore_script(&history_path)?;
+                std::fs::write(&script_path, script).ok()?;
+                let script_path = windows_path_to_msys(&script_path)?;
+                format!(r#" -c "source {}""#, shell_single_quote(&script_path))
+            };
+            return Some(TerminalLaunch {
+                exe_path: launcher.to_string_lossy().into_owned(),
+                cmd_line: format!(
+                    r#""{}" "{arg}"{history_args}"#,
+                    launcher.to_string_lossy()
+                ),
+            });
+        }
         _ => None,
+    }?;
+
+    Some(TerminalLaunch {
+        exe_path: exe_path.to_string(),
+        cmd_line,
+    })
+}
+
+/// True when a saved terminal session belongs to the executable that owns the
+/// captured window. `unknown` is accepted for old Git Bash snapshots whose
+/// mintty titles still contain an authoritative MSYS working directory.
+pub fn session_matches_executable(session: &TerminalSession, exe_path: &str) -> bool {
+    let stem = executable_stem(exe_path);
+    matches!(
+        (effective_shell(session, exe_path), stem.as_str()),
+        ("powershell", "powershell")
+            | ("pwsh", "pwsh")
+            | ("cmd", "cmd")
+            | ("windows_terminal", "windowsterminal")
+            | ("git_bash", "mintty")
+    )
+}
+
+fn effective_shell<'a>(session: &'a TerminalSession, exe_path: &str) -> &'a str {
+    if session.shell == "unknown"
+        && executable_stem(exe_path) == "mintty"
+        && git_bash_cwd_from_title(&session.window_title).is_some()
+    {
+        "git_bash"
+    } else {
+        session.shell.as_str()
     }
+}
+
+fn executable_stem(exe_path: &str) -> String {
+    std::path::Path::new(exe_path)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn git_bash_launcher_path(mintty_path: &str) -> Option<std::path::PathBuf> {
+    std::path::Path::new(mintty_path)
+        .ancestors()
+        .map(|ancestor| ancestor.join("git-bash.exe"))
+        .find(|candidate| candidate.is_file())
+}
+
+fn windows_path_to_msys(path: &std::path::Path) -> Option<String> {
+    let separator = std::path::MAIN_SEPARATOR;
+    let windows = path.to_string_lossy().replace(separator, "/");
+    let bytes = windows.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let drive = (bytes[0] as char).to_ascii_lowercase();
+        let suffix = windows.get(2..).unwrap_or_default().trim_start_matches('/');
+        return Some(if suffix.is_empty() {
+            format!("/{drive}")
+        } else {
+            format!("/{drive}/{suffix}")
+        });
+    }
+    None
+}
+
+fn shell_single_quote(value: &str) -> String {
+    let quote = char::from(39u8);
+    format!("'{}'", value.replace(quote, r#"'"'"'"#))
+}
+
+fn build_bash_restore_script(history_path: &std::path::Path) -> Option<String> {
+    let history_path = shell_single_quote(&windows_path_to_msys(history_path)?);
+    Some(format!(
+        r#"#!/usr/bin/env bash
+printf '\n  --- Restored session history ---\n'
+tail -n 20 -- {history_path} | while IFS= read -r line; do
+  printf '  %s\n' "$line"
+done
+printf '  --------------------------------\n\n'
+exec /usr/bin/bash --login -i
+"#
+    ))
 }
 
 #[cfg(all(windows, test))]
 mod tests {
-    use super::cwd_for_pid;
+    use super::{
+        cwd_for_pid, git_bash_cwd_from_title, read_history_tail, session_matches_executable,
+        shell_type, terminal_launch_cmd,
+    };
+    use crate::TerminalSession;
+
+    #[test]
+    fn parses_git_bash_title_into_windows_cwd() {
+        let title = format!(
+            "MINGW64:/c/Users/Alice/project with spaces{}",
+            char::from_u32(0xa0).unwrap()
+        );
+        assert_eq!(
+            git_bash_cwd_from_title(&title).as_deref(),
+            Some(r"C:\Users\Alice\project with spaces")
+        );
+        assert_eq!(
+            git_bash_cwd_from_title("MSYS:/d/repo/src-tauri").as_deref(),
+            Some(r"D:\repo\src-tauri")
+        );
+        assert_eq!(
+            git_bash_cwd_from_title("MINGW64:/c").as_deref(),
+            Some(r"C:\")
+        );
+        assert_eq!(
+            git_bash_cwd_from_title("MINGW64://server/share/project").as_deref(),
+            Some(r"\\server\share\project")
+        );
+    }
+
+    #[test]
+    fn legacy_mintty_snapshot_uses_git_bash_launcher_and_saved_cwd() {
+        let root = std::env::temp_dir()
+            .join("pc_snapshot_git_bash_launcher_test")
+            .join(std::process::id().to_string());
+        let mintty = root.join("usr").join("bin").join("mintty.exe");
+        let git_bash = root.join("git-bash.exe");
+        std::fs::create_dir_all(mintty.parent().unwrap()).unwrap();
+        std::fs::write(&mintty, []).unwrap();
+        std::fs::write(&git_bash, []).unwrap();
+
+        let session = TerminalSession {
+            shell: "unknown".to_string(),
+            cwd: String::new(),
+            history: vec!["git status".to_string()],
+            window_title: "MINGW64:/c/Users/Alice/project with spaces".to_string(),
+        };
+        assert_eq!(shell_type(mintty.to_str().unwrap()), "git_bash");
+        assert!(session_matches_executable(
+            &session,
+            mintty.to_str().unwrap()
+        ));
+
+        let launch =
+            terminal_launch_cmd(mintty.to_str().unwrap(), &session, &root, 1).unwrap();
+        assert_eq!(launch.exe_path, git_bash.to_string_lossy());
+        let args = crate::tokenize(&launch.cmd_line);
+        assert_eq!(args[0], git_bash.to_string_lossy());
+        assert_eq!(args[1], r"--cd=C:\Users\Alice\project with spaces");
+        assert_eq!(args[2], "-c");
+        assert!(args[3].starts_with("source '/"));
+
+        let script = std::fs::read_to_string(root.join("restore_git_bash_1.sh")).unwrap();
+        let history = std::fs::read_to_string(root.join("restore_git_bash_1.history")).unwrap();
+        assert!(script.contains("--- Restored session history ---"));
+        assert!(script.contains("exec /usr/bin/bash --login -i"));
+        assert_eq!(history, "git status");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bash_history_capture_keeps_the_latest_fifty_commands() {
+        let root = std::env::temp_dir()
+            .join("pc_snapshot_git_bash_history_test")
+            .join(std::process::id().to_string());
+        std::fs::create_dir_all(&root).unwrap();
+        let history_path = root.join(".bash_history");
+        let contents = (0..55)
+            .map(|index| format!("command-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&history_path, contents).unwrap();
+
+        let history = read_history_tail(&history_path);
+        assert_eq!(history.len(), 50);
+        assert_eq!(history.first().map(String::as_str), Some("command-5"));
+        assert_eq!(history.last().map(String::as_str), Some("command-54"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// End-to-end check of the PEB read: spawn a child with a known working
     /// directory and confirm `cwd_for_pid` recovers it. Exercises the x64

@@ -22,6 +22,11 @@ export async function restoreSnapshot(
   return invoke<RestoreResult>("restore_snapshot", { id, closeOthers });
 }
 
+/** Restore one captured application without closing or changing other apps. */
+export async function restoreApp(id: string, exePath: string): Promise<RestoreResult> {
+  return invoke<RestoreResult>("restore_app", { id, exePath });
+}
+
 /** Whether the desktop the user is currently looking at is already captured somewhere. */
 export async function isCurrentStateSaved(): Promise<boolean> {
   return invoke<boolean>("is_current_state_saved");

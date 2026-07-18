@@ -655,6 +655,148 @@ async fn restore_snapshot(
     Ok(result)
 }
 
+/// Build the smallest snapshot that can safely travel through the normal restore
+/// engine for one application. The executable must come from the persisted
+/// snapshot; callers cannot use this command as an arbitrary process launcher.
+fn snapshot_for_app(snapshot: &Snapshot, exe_path: &str) -> Result<(Snapshot, String), String> {
+    if exe_path.trim().is_empty() {
+        return Err("This app has no executable path recorded and cannot be restored".to_string());
+    }
+
+    let selected = snapshot
+        .processes
+        .iter()
+        .find(|process| process.exe_path.eq_ignore_ascii_case(exe_path))
+        .ok_or_else(|| "The selected app is not part of this snapshot".to_string())?;
+    let app_name = std::path::Path::new(&selected.name)
+        .file_stem()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| selected.name.clone());
+    let stem = restore::exe_stem_pub(&selected.exe_path);
+    let is_vscode = matches!(stem.as_str(), "code" | "code-insiders" | "cursor");
+
+    let mut app_snapshot = snapshot.clone();
+    app_snapshot
+        .processes
+        .retain(|process| process.exe_path.eq_ignore_ascii_case(exe_path));
+    app_snapshot
+        .windows
+        .retain(|window| window.exe_path.eq_ignore_ascii_case(exe_path));
+    app_snapshot
+        .terminal_sessions
+        .retain(|session| terminal::session_matches_executable(session, exe_path));
+    app_snapshot.browser_sessions.retain(|session| {
+        let candidates: std::collections::HashSet<String> = snapshot
+            .processes
+            .iter()
+            .filter(|process| !process.exe_path.is_empty())
+            .map(|process| restore::exe_stem_pub(&process.exe_path))
+            .filter(|candidate| browser_family_matches_exe(&session.browser.family, candidate))
+            .collect();
+        candidates.len() == 1 && candidates.contains(&stem)
+    });
+
+    let browser_prefix = format!("browser_tab:{stem}:");
+    let office_prefix = format!("office_extra_file:{stem}:");
+    app_snapshot.restore_hints.retain(|hint| {
+        hint.starts_with(&browser_prefix)
+            || hint.starts_with(&office_prefix)
+            || (is_vscode
+                && (hint.starts_with("vscode_folder:") || hint.starts_with("vscode_workspace:")))
+            || hint
+                .strip_prefix("foreground:")
+                .is_some_and(|value| restore::exe_stem_pub(value) == stem)
+    });
+    // Context clues are descriptive capture metadata and are not read by the
+    // restore engine. Excluding unrelated clues keeps this transient slice honest.
+    app_snapshot.context_clues.clear();
+
+    Ok((app_snapshot, app_name))
+}
+
+fn browser_family_matches_exe(family: &str, stem: &str) -> bool {
+    let family = family.to_ascii_lowercase();
+    match stem {
+        "chrome" | "chromium" => matches!(family.as_str(), "chrome" | "chromium"),
+        "msedge" => matches!(family.as_str(), "edge" | "msedge" | "microsoft edge"),
+        "firefox" => family == "firefox",
+        "brave" => family == "brave",
+        "opera" | "opera_gx" => matches!(family.as_str(), "opera" | "opera gx"),
+        "vivaldi" => family == "vivaldi",
+        "arc" => family == "arc",
+        _ => false,
+    }
+}
+
+#[tauri::command]
+async fn restore_app(
+    app: tauri::AppHandle,
+    id: String,
+    exe_path: String,
+    browser_bridge: tauri::State<'_, browser_bridge::BrowserBridge>,
+) -> Result<RestoreResult, String> {
+    let dir = snapshots_dir(&app)?;
+    let path = json_path(&dir, &id);
+    let snapshot = try_load_snapshot(&path)
+        .ok_or_else(|| format!("Snapshot {id} is missing, corrupt, or unreadable"))?;
+    let snapshot_name = snapshot.name.clone();
+    let (app_snapshot, app_name) = snapshot_for_app(&snapshot, &exe_path)?;
+    let sessions = app_snapshot.browser_sessions.clone();
+    let has_browser_sessions = !sessions.is_empty();
+    let ignore_list = config::load_config(&app).ignore_list;
+
+    // Selective restore is additive by contract: it never closes other apps or
+    // surplus windows belonging to the selected app.
+    let mut result = tauri::async_runtime::spawn_blocking(move || {
+        restore::restore_desktop(&app_snapshot, false, &ignore_list, has_browser_sessions)
+    })
+    .await
+    .map_err(|e| format!("Restore task failed: {e}"))?;
+
+    if has_browser_sessions {
+        let reply = browser_bridge
+            .inner()
+            .clone()
+            .restore(&sessions, false)
+            .await;
+        result.warnings.extend(reply.warnings);
+    }
+    restore::focus_app(&exe_path);
+
+    result.message = if !result.failed_items.is_empty() {
+        format!("{app_name} could not be fully restored")
+    } else if !result.warnings.is_empty() {
+        format!(
+            "{app_name} restored with {} warning(s)",
+            result.warnings.len()
+        )
+    } else {
+        format!("{app_name} restored")
+    };
+
+    let mut details = result.failed_items.clone();
+    details.extend(result.warnings.clone());
+    activity::append(
+        &app,
+        activity::event(
+            "restore_app",
+            Some(snapshot_name),
+            if !result.failed_items.is_empty() {
+                "failed"
+            } else if !result.warnings.is_empty() {
+                "warning"
+            } else {
+                "success"
+            },
+            result.message.clone(),
+            details,
+        ),
+    );
+    // A partial restore deliberately does not update active_session: the live
+    // desktop is not equivalent to the complete snapshot.
+    Ok(result)
+}
+
 /// Heuristic: is the desktop the user is looking at right now already captured in some
 /// saved snapshot? Compares the set of currently-open apps against each snapshot's app
 /// set (Jaccard similarity). Used to warn before a clean restore would discard unsaved
@@ -850,6 +992,7 @@ pub fn run() {
             close_all_windows,
             activity::list_activity,
             restore_snapshot,
+            restore_app,
             delete_snapshot,
             clear_all_snapshots,
             is_current_state_saved,
@@ -868,7 +1011,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod snapshot_schema_tests {
-    use super::Snapshot;
+    use super::{snapshot_for_app, Snapshot};
 
     #[test]
     fn v2_snapshot_without_browser_sessions_remains_readable() {
@@ -911,5 +1054,99 @@ mod snapshot_schema_tests {
         .expect("browser context must not invalidate the desktop snapshot");
 
         assert!(snapshot.browser_sessions.is_empty());
+    }
+
+    #[test]
+    fn selective_restore_slice_contains_only_the_requested_app() {
+        let snapshot: Snapshot = serde_json::from_str(
+            r#"{
+            "schema_version": 3,
+            "id": "snap_selective",
+            "name": "Mixed workspace",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "processes": [
+                {"name":"opera.exe","pid":10,"exe_path":"C:\\Apps\\opera.exe","cmd_line":"opera.exe","classification":"browser"},
+                {"name":"Code.exe","pid":20,"exe_path":"C:\\Apps\\Code.exe","cmd_line":"Code.exe C:\\repo","classification":"ide"}
+            ],
+            "windows": [
+                {"title":"Opera","position":{"x":1,"y":2},"size":{"width":800,"height":600},"state":"normal","monitor_index":0,"exe_path":"C:\\Apps\\opera.exe"},
+                {"title":"Repo - Code","position":{"x":3,"y":4},"size":{"width":900,"height":700},"state":"normal","monitor_index":0,"exe_path":"C:\\Apps\\Code.exe"}
+            ],
+            "context_clues": [{"type":"browser_tab","value":"https://example.com","confidence":0.9,"source":"test"}],
+            "restore_hints": [
+                "browser_tab:opera:https://example.com",
+                "vscode_folder:C:\\repo",
+                "foreground:Code.exe"
+            ],
+            "warnings": [],
+            "thumbnail_path": "C:/snapshot.png",
+            "terminal_sessions": [{"shell":"powershell","cwd":"C:\\repo","history":[],"window_title":"PowerShell"}],
+            "browser_sessions": [
+                {"protocol_version":1,"browser":{"family":"opera","profile_instance_id":"opera-profile"},"captured_at":"2026-01-01T00:00:00Z","capabilities":{"tab_groups":true},"windows":[]},
+                {"protocol_version":1,"browser":{"family":"edge","profile_instance_id":"edge-profile"},"captured_at":"2026-01-01T00:00:00Z","capabilities":{"tab_groups":true},"windows":[]}
+            ]
+        }"#,
+        )
+        .expect("test snapshot must deserialize");
+
+        let (app, name) = snapshot_for_app(&snapshot, r"C:\Apps\opera.exe")
+            .expect("captured app must be selectable");
+
+        assert_eq!(name, "opera");
+        assert_eq!(app.processes.len(), 1);
+        assert_eq!(app.windows.len(), 1);
+        assert_eq!(app.processes[0].exe_path, r"C:\Apps\opera.exe");
+        assert_eq!(
+            app.restore_hints,
+            vec!["browser_tab:opera:https://example.com"]
+        );
+        assert!(app.context_clues.is_empty());
+        assert!(app.terminal_sessions.is_empty());
+        assert_eq!(app.browser_sessions.len(), 1);
+        assert_eq!(app.browser_sessions[0].browser.family, "opera");
+        assert_eq!(
+            snapshot.processes.len(),
+            2,
+            "the persisted snapshot is not mutated"
+        );
+    }
+
+    #[test]
+    fn selective_restore_rejects_an_executable_not_in_the_snapshot() {
+        let snapshot: Snapshot = serde_json::from_str(
+            r#"{
+            "schema_version":3,"id":"snap_1","name":"One","timestamp":"2026-01-01T00:00:00Z",
+            "processes":[],"windows":[],"context_clues":[],"restore_hints":[],"warnings":[],
+            "thumbnail_path":"C:/snapshot.png","terminal_sessions":[],"browser_sessions":[]
+        }"#,
+        )
+        .unwrap();
+
+        assert!(snapshot_for_app(&snapshot, r"C:\\malicious.exe").is_err());
+        assert!(snapshot_for_app(&snapshot, "").is_err());
+    }
+
+    #[test]
+    fn selective_restore_drops_ambiguous_browser_companion_sessions() {
+        let snapshot: Snapshot = serde_json::from_str(
+            r#"{
+            "schema_version":3,"id":"snap_browsers","name":"Browsers","timestamp":"2026-01-01T00:00:00Z",
+            "processes":[
+                {"name":"chrome.exe","pid":1,"exe_path":"C:\\Chrome\\chrome.exe","cmd_line":"","classification":"browser"},
+                {"name":"chromium.exe","pid":2,"exe_path":"C:\\Chromium\\chromium.exe","cmd_line":"","classification":"browser"}
+            ],
+            "windows":[],"context_clues":[],"restore_hints":["browser_tab:chrome:https://example.com"],"warnings":[],
+            "thumbnail_path":"C:/snapshot.png","terminal_sessions":[],
+            "browser_sessions":[{"protocol_version":1,"browser":{"family":"chromium","profile_instance_id":"ambiguous"},"captured_at":"2026-01-01T00:00:00Z","capabilities":{"tab_groups":true},"windows":[]}]
+        }"#,
+        )
+        .unwrap();
+
+        let (chrome, _) = snapshot_for_app(&snapshot, r"C:\Chrome\chrome.exe").unwrap();
+        assert!(chrome.browser_sessions.is_empty());
+        assert_eq!(
+            chrome.restore_hints,
+            vec!["browser_tab:chrome:https://example.com"]
+        );
     }
 }

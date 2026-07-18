@@ -10,6 +10,7 @@ type Props = {
   snapshots: SnapshotSummary[]; events: ActivityEvent[]; selectedId: string | null; activeSessionId: string | null;
   onSelect: (id: string | null) => void; onCapture: () => void; onStartNew: () => void;
   onRestore: (id: string) => void; onDelete: (id: string) => void; onRecapture: (id: string) => void;
+  onRestoreApp: (id: string, exePath: string, appName: string) => void; restoringAppKey: string | null;
   onClearAll: () => void; onImport: () => void; onHelp: () => void; onRefresh: () => void;
   onIgnoreList: () => void; onToggleTerminalHook: () => void; terminalHookEnabled: boolean;
 };
@@ -64,14 +65,26 @@ export function MissionControl(p: Props) {
       if (e.ctrlKey && e.key.toLowerCase() === "s") { e.preventDefault(); p.onCapture(); }
       if (e.ctrlKey && e.key.toLowerCase() === "k") { e.preventDefault(); searchRef.current?.focus(); }
       if (e.key === "Escape") { if (showSettings) setShowSettings(false); else p.onSelect(null); }
-      if (p.selectedId && e.key === "Enter") p.onRestore(p.selectedId);
-      if (p.selectedId && e.key === "Delete") p.onDelete(p.selectedId);
+      const interactive = e.target instanceof HTMLElement && e.target.closest("button,input,textarea,select,[contenteditable='true']");
+      if (!interactive && !showSettings && p.selectedId && e.key === "Enter") p.onRestore(p.selectedId);
+      if (!interactive && !showSettings && p.selectedId && e.key === "Delete") p.onDelete(p.selectedId);
     }; window.addEventListener("keydown", key); return () => window.removeEventListener("keydown", key);
   }, [p, showSettings]);
   return <div className="app-frame" style={{ "--right-w": `${rightWidth}px` } as React.CSSProperties}>
-    <header className="titlebar" data-tauri-drag-region><span className="brand-mark" data-tauri-drag-region/> <span data-tauri-drag-region>PC Snapshot</span><div className="window-actions">
-      <button type="button" aria-label="Minimize" onClick={() => getCurrentWindow().minimize()}><svg width="11" height="11" viewBox="0 0 10 10" shapeRendering="crispEdges"><line x1="1" y1="5" x2="9" y2="5" stroke="currentColor" strokeWidth="1"/></svg></button><button type="button" aria-label="Maximize" onClick={() => getCurrentWindow().toggleMaximize()}><svg width="11" height="11" viewBox="0 0 10 10" shapeRendering="crispEdges"><rect x="1" y="1" width="8" height="8" fill="none" stroke="currentColor" strokeWidth="1"/></svg></button><button type="button" aria-label="Close" className="close" onClick={() => getCurrentWindow().close()}><svg width="11" height="11" viewBox="0 0 10 10"><line x1="1.5" y1="1.5" x2="8.5" y2="8.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/><line x1="8.5" y1="1.5" x2="1.5" y2="8.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg></button>
-    </div></header>
+    <div
+      className="titlebar-reveal-zone"
+      onMouseDown={e => {
+        if (e.button === 0 && !(e.target as Element).closest("button")) {
+          getCurrentWindow().startDragging().catch(() => {});
+        }
+      }}
+    >
+      <header className="titlebar">
+        <div className="window-actions">
+          <button type="button" aria-label="Minimize" onClick={() => getCurrentWindow().minimize()}><svg width="11" height="11" viewBox="0 0 10 10" shapeRendering="crispEdges"><line x1="1" y1="5" x2="9" y2="5" stroke="currentColor" strokeWidth="1"/></svg></button><button type="button" aria-label="Maximize" onClick={() => getCurrentWindow().toggleMaximize()}><svg width="11" height="11" viewBox="0 0 10 10" shapeRendering="crispEdges"><rect x="1" y="1" width="8" height="8" fill="none" stroke="currentColor" strokeWidth="1"/></svg></button><button type="button" aria-label="Close" className="close" onClick={() => getCurrentWindow().close()}><svg width="11" height="11" viewBox="0 0 10 10"><line x1="1.5" y1="1.5" x2="8.5" y2="8.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/><line x1="8.5" y1="1.5" x2="1.5" y2="8.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/></svg></button>
+        </div>
+      </header>
+    </div>
     {!showSettings && <>
     <aside className="sidebar">
       <button className="rail-button active" onClick={p.onCapture}><Icon>◉</Icon><span>Capture</span></button>
@@ -108,7 +121,20 @@ export function MissionControl(p: Props) {
             {details.warnings.map((warning, index) => <div className="warning-message" key={`${index}-${warning}`}><span>!</span><p>{warning}</p></div>)}
           </div>}
           <div className="contents-head"><span>CONTENTS</span><span>{details?.processes.length ?? "…"} apps</span></div>
-          {details?.processes.map(proc => <div className="app-row" key={`${proc.pid}-${proc.name}`}><AppIcon proc={proc}/><b>{proc.name.replace(/\.exe$/i, "")}</b><small>{details.windows.filter(w => w.exe_path?.toLowerCase().includes(proc.name.replace(/\.exe$/i,"" ).toLowerCase())).length || ""}</small></div>)}
+          {details?.processes.map(proc => {
+            const appName = proc.name.replace(/\.exe$/i, "");
+            const restoreKey = `${details.id}:${proc.exe_path.toLowerCase()}`;
+            const restoring = p.restoringAppKey === restoreKey;
+            const windowCount = details.windows.filter(w => w.exe_path?.toLowerCase() === proc.exe_path.toLowerCase()).length;
+            return <div className="app-row" key={`${proc.pid}-${proc.name}`}><AppIcon proc={proc}/><b>{appName}</b><span className="app-row-trailing"><small className="app-count">{windowCount || ""}</small><button
+              type="button"
+              className={`app-restore-button ${restoring ? "restoring" : ""}`}
+              disabled={!proc.exe_path || restoring || p.restoringAppKey !== null}
+              aria-label={`Restore ${appName}`}
+              title={proc.exe_path ? `Restore ${appName}` : "Restore unavailable: executable path was not captured"}
+              onClick={e => { e.stopPropagation(); if (p.selectedId && proc.exe_path) p.onRestoreApp(p.selectedId, proc.exe_path, appName); }}
+            ><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v6h6"/></svg></button></span></div>;
+          })}
         </div>
         <div className="detail-actions"><button className="primary" onClick={() => p.selectedId && p.onRestore(p.selectedId)}>↻ Restore</button><button onClick={() => p.selectedId && p.onRecapture(p.selectedId)}>↻</button><button className="danger" aria-label="Delete" onClick={() => p.selectedId && p.onDelete(p.selectedId)}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></button></div>
       </section>
