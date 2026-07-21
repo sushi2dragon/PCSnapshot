@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getSnapshot, getAppIcon } from "../commands/snapshots";
 import type { ActivityEvent, ProcessInfo, Snapshot, SnapshotSummary } from "../types/snapshot";
+import { thumbnailUrl } from "../utils/thumbnail";
 import { SettingsMenu } from "./SettingsMenu";
 import { SettingsPage } from "./SettingsPage";
 
@@ -103,7 +103,7 @@ export function MissionControl(p: Props) {
       {p.snapshots.length === 0 ? <div className="mission-empty"><div className="empty-mark">□</div><h1>Save your first workspace</h1><p>PC Snapshot remembers your open apps, windows, tabs and terminal — so you can bring the whole setup back in one click. Everything stays on this PC.</p><button className="primary" onClick={p.onCapture}>◉ Capture my desktop <kbd>Ctrl S</kbd></button><button className="link" onClick={p.onImport}>or import snapshots from a backup</button></div> : <>
         <div className="grid-header"><h1>All snapshots <small>{p.snapshots.length}</small></h1><div className="search">⌕ <input ref={searchRef} value={search} onChange={e => setSearch(e.target.value)} placeholder="Search or filter"/></div></div>
         <div className="snapshot-grid">{filtered.map(s => <article key={s.id} className={`snapshot-card ${p.selectedId === s.id ? "selected" : ""} ${s.warning_count ? "has-warning" : "ok"}`} onClick={() => p.onSelect(p.selectedId === s.id ? null : s.id)}>
-          <div className="thumb">{s.thumbnail_path && <img src={convertFileSrc(s.thumbnail_path)} alt=""/>}<div className="card-actions"><button onClick={e => {e.stopPropagation(); p.onRestore(s.id)}}>Restore</button><button aria-label={`Recapture ${s.name}`} title="Recapture" onClick={e => {e.stopPropagation(); p.onRecapture(s.id)}}>↻</button><button aria-label={`Delete ${s.name}`} title="Delete" onClick={e => {e.stopPropagation(); p.onDelete(s.id)}}>×</button></div></div>
+          <div className="thumb">{s.thumbnail_path && <img src={thumbnailUrl(s.thumbnail_path, s.timestamp)} alt=""/>}<div className="card-actions"><button onClick={e => {e.stopPropagation(); p.onRestore(s.id)}}>Restore</button><button aria-label={`Recapture ${s.name}`} title="Recapture" onClick={e => {e.stopPropagation(); p.onRecapture(s.id)}}>↻</button><button aria-label={`Delete ${s.name}`} title="Delete" onClick={e => {e.stopPropagation(); p.onDelete(s.id)}}>×</button></div></div>
           <div className="card-copy"><div className="card-name"><strong>{s.name}</strong><button aria-label={`Rename ${s.name}`} title="Rename" onClick={e => {e.stopPropagation(); p.onRename(s.id)}}><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg></button></div>{p.activeSessionId === s.id
             ? <span className="working">● <i>Currently working</i></span>
             : s.warning_count
@@ -118,7 +118,7 @@ export function MissionControl(p: Props) {
       <section className="panel-page details">
         <div className="detail-scroll">
           <button className="back" onClick={() => p.onSelect(null)}>← Activity</button>
-          <div className="detail-preview">{selected?.thumbnail_path && <img src={convertFileSrc(selected.thumbnail_path)} alt=""/>}<span>preview · {new Set([...(details?.windows ?? []), ...(details?.explorer_windows ?? [])].map(w => w.monitor_index)).size || 1} monitors</span></div>
+          <div className="detail-preview">{selected?.thumbnail_path && <img src={thumbnailUrl(selected.thumbnail_path, selected.timestamp)} alt=""/>}<span>preview · {new Set([...(details?.windows ?? []), ...(details?.explorer_windows ?? [])].map(w => w.monitor_index)).size || 1} monitors</span></div>
           <h2>{selected?.name}</h2>
           <p className="muted">Captured {selected ? relative(selected.timestamp).toLowerCase() : ""}</p>
           <p className={selected?.warning_count ? "warning-text" : "success-text"}>● {selected?.warning_count ? `Captured with ${selected.warning_count} warning${selected.warning_count === 1 ? "" : "s"}` : "Captured successfully"}</p>
@@ -172,7 +172,7 @@ export function MissionControl(p: Props) {
         <div className="picker-list">
           {p.snapshots.length === 0 ? <div className="picker-empty">No snapshots saved yet.</div> : p.snapshots.map(s =>
             <button key={s.id} className="picker-row" onClick={() => { setShowPicker(false); p.onRestore(s.id); }}>
-              <span className="thumb-sm">{s.thumbnail_path && <img src={convertFileSrc(s.thumbnail_path)} alt=""/>}</span>
+              <span className="thumb-sm">{s.thumbnail_path && <img src={thumbnailUrl(s.thumbnail_path, s.timestamp)} alt=""/>}</span>
               <span className="picker-row-copy"><b>{s.name}</b><small>{relative(s.timestamp)}</small></span>
             </button>
           )}

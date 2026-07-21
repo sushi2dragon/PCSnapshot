@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import type { SnapshotSummary } from "../types/snapshot";
+import { thumbnailUrl } from "../utils/thumbnail";
 
 interface SnapshotTileProps {
   snapshot: SnapshotSummary;
@@ -34,14 +34,6 @@ export function SnapshotTile({ snapshot, onRestore, onDelete, onRecapture }: Sna
     };
   }, []);
 
-  // Convert an absolute filesystem path into a URL the webview is allowed to load.
-  // Tauri blocks raw file:// access; convertFileSrc routes through the asset
-  // protocol (scoped to the snapshots dir in tauri.conf.json).
-  const getThumbnailUrl = (path: string): string => {
-    if (!path) return "";
-    return convertFileSrc(path);
-  };
-
   const handleDeleteClick = (e: React.MouseEvent) => {
     e.stopPropagation();
     if (confirmDelete) {
@@ -73,7 +65,7 @@ export function SnapshotTile({ snapshot, onRestore, onDelete, onRecapture }: Sna
       >
         {snapshot.thumbnail_path ? (
           <img
-            src={getThumbnailUrl(snapshot.thumbnail_path)}
+            src={thumbnailUrl(snapshot.thumbnail_path, snapshot.timestamp)}
             alt={snapshot.name}
             className="w-full h-full object-cover"
           />

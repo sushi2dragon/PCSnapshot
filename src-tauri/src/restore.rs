@@ -26,10 +26,11 @@ pub fn restore_desktop(
     let mut failed_items: Vec<String> = vec![];
 
     // ── 1. Reuse-if-running ───────────────────────────────────────────────────────────
-    // Count how many instances of each exe are currently running. A process is only
+    // Count how many instances of each exe are currently running, keyed by exe
+    // *stem* (the same key the reposition pass matches on). A process is only
     // "covered" if a running instance exists for it — but if the snapshot has 2
     // PowerShell windows and only 1 is running, we still need to launch 1 more.
-    let running = running_exe_paths_counted();
+    let running = running_instances_by_stem();
 
     // ── 2. Ordered launch of everything not already open ──────────────────────────────
     // For each exe_path, subtract running-count from snapshot-count to find how many
@@ -82,7 +83,7 @@ pub fn restore_desktop(
             if crate::config::is_ignored(&exe_stem(&p.exe_path), ignore_list) {
                 return false;
             }
-            let key = p.exe_path.to_ascii_lowercase();
+            let key = exe_stem(&p.exe_path);
             let running_count = running.get(&key).copied().unwrap_or(0);
             let used = covered.entry(key).or_insert(0);
             if *used < running_count {
@@ -599,6 +600,10 @@ pub fn restore_desktop(
         })
         .collect();
     let mut consumed: HashSet<isize> = HashSet::new();
+    // (hwnd, target) for every window we placed — re-asserted once after a settle
+    // delay so an async un-snap transition or an app that repositions its own
+    // window just after showing it cannot leave the window where we didn't put it.
+    let mut placed: Vec<(isize, &WindowInfo)> = Vec::new();
     let deadline = Instant::now() + Duration::from_millis(8000);
     while !pending.is_empty() && Instant::now() < deadline {
         let live = live_windows();
@@ -609,6 +614,7 @@ pub fn restore_desktop(
             if let Some(hwnd) = match_window_titled(&live, &target.title, &consumed) {
                 apply_geometry(hwnd, target);
                 consumed.insert(hwnd);
+                placed.push((hwnd, target));
                 false
             } else {
                 true
@@ -620,6 +626,7 @@ pub fn restore_desktop(
             if let Some(hwnd) = match_window_by_exe(&live, &target.exe_path, &consumed) {
                 apply_geometry(hwnd, target);
                 consumed.insert(hwnd);
+                placed.push((hwnd, target));
                 false
             } else {
                 true
@@ -630,6 +637,16 @@ pub fn restore_desktop(
             break;
         }
         std::thread::sleep(Duration::from_millis(150));
+    }
+
+    // Second pass: re-apply geometry to everything we placed. The first apply can
+    // be overridden by the un-snap settle or by the app's own late window
+    // management; re-asserting after a short delay wins the last word.
+    if !placed.is_empty() {
+        std::thread::sleep(Duration::from_millis(300));
+        for (hwnd, target) in &placed {
+            apply_geometry(*hwnd, target);
+        }
     }
 
     // Soft warnings: windows we never managed to place, with a human-readable reason.
@@ -1193,24 +1210,52 @@ fn exe_path_for_pid(pid: u32) -> String {
     }
 }
 
-/// Count of running instances per lowercased full exe path.
-/// Used to determine how many new instances we need to launch per app.
+/// Count of running instances per exe *stem*, keyed the same way the reposition
+/// pass matches windows. Unions two resolvers because neither alone is complete:
+/// sysinfo catches processes with no visible window (tray-resident apps), but
+/// frequently can't read a packaged/Store app's path (modern Notepad, etc.);
+/// `live_windows` resolves those via `QueryFullProcessImageNameW`. Counting by
+/// distinct PID keeps "is it already running?" consistent with "can we reposition
+/// its window?", so a running instance is never double-launched.
 #[cfg(windows)]
-fn running_exe_paths_counted() -> std::collections::HashMap<String, usize> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-    let mut sys = System::new();
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        ProcessRefreshKind::new().with_exe(UpdateKind::Always),
-    );
-    let mut map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for p in sys.processes().values() {
-        if let Some(exe) = p.exe() {
-            *map.entry(exe.to_string_lossy().to_ascii_lowercase())
-                .or_insert(0) += 1;
+fn running_instances_by_stem() -> std::collections::HashMap<String, usize> {
+    use std::collections::{HashMap, HashSet};
+    // stem -> distinct PIDs, so a process hosting several windows counts once.
+    let mut pids_by_stem: HashMap<String, HashSet<u32>> = HashMap::new();
+
+    // Source 1: sysinfo — includes running processes without a visible window.
+    {
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            ProcessRefreshKind::new().with_exe(UpdateKind::Always),
+        );
+        for (pid, p) in sys.processes() {
+            if let Some(exe) = p.exe() {
+                let stem = exe_stem(&exe.to_string_lossy());
+                if !stem.is_empty() {
+                    pids_by_stem.entry(stem).or_default().insert(pid.as_u32());
+                }
+            }
         }
     }
-    map
+
+    // Source 2: owners of live top-level windows — resolves packaged apps that
+    // sysinfo reports with no path.
+    for w in live_windows() {
+        if !w.exe.is_empty() {
+            let stem = exe_stem(&w.exe);
+            if !stem.is_empty() {
+                pids_by_stem.entry(stem).or_default().insert(w.pid);
+            }
+        }
+    }
+
+    pids_by_stem
+        .into_iter()
+        .map(|(stem, pids)| (stem, pids.len()))
+        .collect()
 }
 
 // ── Window manipulation ───────────────────────────────────────────────────────────────
@@ -1252,11 +1297,15 @@ fn apply_geometry(hwnd_raw: isize, target: &WindowInfo) {
 fn focus_window(hwnd_raw: isize) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        BringWindowToTop, SetForegroundWindow, ShowWindow, SW_RESTORE,
+        BringWindowToTop, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
     };
     let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
     unsafe {
-        let _ = ShowWindow(hwnd, SW_RESTORE);
+        // Only un-minimize; never SW_RESTORE an already-visible window or we would
+        // un-maximize / un-snap the very window we just placed.
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
         let _ = BringWindowToTop(hwnd);
         let _ = SetForegroundWindow(hwnd);
     }

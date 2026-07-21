@@ -400,12 +400,12 @@ fn enumerate_monitors() -> Vec<isize> {
 /// Enumerate real, user-facing top-level windows and collect raw geometry/title/pid.
 #[cfg(windows)]
 fn enumerate_windows() -> Result<Vec<RawWindow>, String> {
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
     use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindow, GetWindowLongW, GetWindowPlacement, GetWindowTextLengthW,
-        GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+        EnumWindows, GetWindow, GetWindowLongW, GetWindowPlacement, GetWindowRect,
+        GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
         GWL_EXSTYLE, GW_OWNER, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
         WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
     };
@@ -459,17 +459,28 @@ fn enumerate_windows() -> Result<Vec<RawWindow>, String> {
             return TRUE;
         }
 
-        // Placement gives the restored rect + show state in one call.
+        // Placement gives the show state; GetWindowRect gives the true on-screen
+        // rect. For an Aero-snapped window these disagree: showCmd reads as
+        // SW_SHOWNORMAL while rcNormalPosition holds the *pre-snap* restore rect,
+        // not where the window actually sits. So we take the show state from
+        // placement but, for normal (incl. snapped) windows, persist the visible
+        // frame rect — that is what restore must reproduce. Maximized/minimized
+        // windows keep the restore rect so un-maximizing later lands sanely.
         let mut wp = WINDOWPLACEMENT {
             length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
             ..Default::default()
         };
         let (pos, size, state) = if GetWindowPlacement(hwnd, &mut wp).is_ok() {
-            let r = wp.rcNormalPosition;
             let state = match wp.showCmd {
                 x if x == SW_SHOWMINIMIZED.0 as u32 => "minimized",
                 x if x == SW_SHOWMAXIMIZED.0 as u32 => "maximized",
                 _ => "normal",
+            };
+            let mut frame = RECT::default();
+            let r = if state == "normal" && GetWindowRect(hwnd, &mut frame).is_ok() {
+                frame
+            } else {
+                wp.rcNormalPosition
             };
             (
                 WindowPosition { x: r.left, y: r.top },
