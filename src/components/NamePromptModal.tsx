@@ -3,6 +3,8 @@ import { useState, useEffect, useRef } from "react";
 interface NamePromptModalProps {
   isOpen: boolean;
   defaultName: string;
+  title?: string;
+  confirmLabel?: string;
   onConfirm: (name: string) => void;
   onCancel: () => void;
 }
@@ -10,6 +12,8 @@ interface NamePromptModalProps {
 export function NamePromptModal({
   isOpen,
   defaultName,
+  title = "Name your snapshot",
+  confirmLabel = "Save",
   onConfirm,
   onCancel,
 }: NamePromptModalProps) {
@@ -51,7 +55,7 @@ export function NamePromptModal({
           className="text-sm font-semibold mb-4"
           style={{ color: "var(--text-primary)" }}
         >
-          Name your snapshot
+          {title}
         </h2>
         <input
           ref={inputRef}
@@ -95,7 +99,7 @@ export function NamePromptModal({
               (e.currentTarget.style.backgroundColor = "var(--color-accent)")
             }
           >
-            Save
+            {confirmLabel}
           </button>
         </div>
       </div>

@@ -72,6 +72,13 @@ pub fn restore_desktop(
             if is_vscode_family(&p.exe_path) {
                 return false;
             }
+            // Terminals are restored from captured shell sessions (process-based, see
+            // restore_terminal_sessions), not from window enumeration — skip them here.
+            if Category::from_str(&p.classification) == Category::Terminal
+                || classify::classify(&p.exe_path, true) == Category::Terminal
+            {
+                return false;
+            }
             if crate::config::is_ignored(&exe_stem(&p.exe_path), ignore_list) {
                 return false;
             }
@@ -88,7 +95,7 @@ pub fn restore_desktop(
         .collect();
     launch_list.sort_by_key(|p| Category::from_str(&p.classification).launch_rank());
 
-    let mut terminal_indices: HashMap<String, usize> = HashMap::new();
+    let mut terminal_used: HashMap<String, Vec<usize>> = HashMap::new();
     let mut extra_window_exes_handled: HashSet<String> = HashSet::new();
 
     for proc_ in &launch_list {
@@ -125,7 +132,7 @@ pub fn restore_desktop(
             };
             (proc_.exe_path.clone(), cmd)
         } else if is_terminal_proc {
-            terminal_restore_cmd(snapshot, proc_, &mut terminal_indices, None)
+            terminal_restore_cmd(snapshot, proc_, &mut terminal_used, None)
                 .map(|command| (command.exe_path, command.cmd_line))
                 .unwrap_or_else(|| (proc_.exe_path.clone(), proc_.cmd_line.clone()))
         } else {
@@ -211,6 +218,18 @@ pub fn restore_desktop(
         }
     }
 
+    // Terminals: launch each captured interactive shell directly at its saved cwd +
+    // history. Windows 11 re-hosts the launched shell in Windows Terminal. Count-based
+    // dedup avoids duplicating a terminal the user still has open. Window position and
+    // tab grouping are intentionally not restored.
+    let mut terminal_closed: Vec<String> = vec![];
+    restore_terminal_sessions(
+        &snapshot.terminal_sessions,
+        close_others,
+        &mut failed_items,
+        &mut terminal_closed,
+    );
+
     // Exes the main launch loop already handled — both the deficit pass and the
     // terminal reconciliation below must skip these to avoid double-launching.
     let launched_exes: std::collections::HashSet<String> = launch_list
@@ -292,25 +311,10 @@ pub fn restore_desktop(
         use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
         use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
 
-        // Collect snapshot terminal windows per exe, skipping exes the main
-        // launch loop already launched this restore.
-        let snap_terminal_windows: Vec<&WindowInfo> = snapshot
-            .windows
-            .iter()
-            .filter(|w| {
-                !w.exe_path.is_empty()
-                    && !launched_exes.contains(&w.exe_path.to_ascii_lowercase())
-                    && (Category::from_str(
-                        &snapshot
-                            .processes
-                            .iter()
-                            .find(|p| p.exe_path.eq_ignore_ascii_case(&w.exe_path))
-                            .map(|p| p.classification.as_str())
-                            .unwrap_or(""),
-                    ) == Category::Terminal
-                        || classify::classify(&w.exe_path, true) == Category::Terminal)
-            })
-            .collect();
+        // Terminals are now restored from captured shell sessions (see
+        // restore_terminal_sessions); the window-based reconciliation is retired
+        // because Windows exposes no reliable terminal-window↔shell mapping.
+        let snap_terminal_windows: Vec<&WindowInfo> = Vec::new();
 
         if !snap_terminal_windows.is_empty() {
             // Exes owning the snapshot's terminal windows. Reconciliation only
@@ -400,11 +404,32 @@ pub fn restore_desktop(
                 }
             }
 
-            // Launch snapshot terminals that have no live match.
+            // Launch snapshot terminals that have no live match — but never more per
+            // exe than are actually missing (captured count − currently-live count).
+            // Title-based matching can fail to recognize a running terminal whose title
+            // drifted since capture (a terminal's title tracks its running command), which
+            // would otherwise launch a duplicate of a window that's already open.
+            let mut launched_per_exe: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
             for (si, sw) in snap_terminal_windows.iter().enumerate() {
                 if matched_snap.contains(&si) {
                     continue;
                 }
+                let snap_count = snap_terminal_windows
+                    .iter()
+                    .filter(|w| w.exe_path.eq_ignore_ascii_case(&sw.exe_path))
+                    .count();
+                let live_count = live_term_wins
+                    .iter()
+                    .filter(|w| w.exe.eq_ignore_ascii_case(&sw.exe_path))
+                    .count();
+                let launched = launched_per_exe
+                    .entry(sw.exe_path.to_ascii_lowercase())
+                    .or_insert(0);
+                if *launched >= snap_count.saturating_sub(live_count) {
+                    continue; // every genuinely-missing window for this exe already launched
+                }
+                *launched += 1;
                 if let Some(proc_) = snapshot
                     .processes
                     .iter()
@@ -414,7 +439,7 @@ pub fn restore_desktop(
                         continue;
                     }
                     let command =
-                        terminal_restore_cmd(snapshot, proc_, &mut terminal_indices, Some(&sw.title));
+                        terminal_restore_cmd(snapshot, proc_, &mut terminal_used, Some(&sw.title));
                     let (launch_exe, cmd) = command
                         .map(|command| (command.exe_path, command.cmd_line))
                         .unwrap_or_else(|| (proc_.exe_path.clone(), proc_.cmd_line.clone()));
@@ -553,11 +578,24 @@ pub fn restore_desktop(
     // The deadline is generous (capture must be <3s, but restore has no such budget):
     // Electron/JVM apps like Teams and Opera routinely take several seconds to show a
     // window, and a too-short deadline was the main reason so many windows were skipped.
+    // Explorer folders are restored through ShellWindows, never by launching or
+    // touching the protected explorer.exe process. Waiting here overlaps with
+    // the startup time of apps launched above.
+    let explorer_outcome = crate::explorer::restore_windows(
+        &snapshot.explorer_windows,
+        close_others && snapshot.schema_version >= 4,
+    );
+    failed_items.extend(explorer_outcome.failed_items);
+
     let mut pending: Vec<&WindowInfo> = snapshot
         .windows
         .iter()
         .filter(|window| {
-            !companion_managed_browsers || !classify::classify(&window.exe_path, true).is_browser()
+            (!companion_managed_browsers
+                || !classify::classify(&window.exe_path, true).is_browser())
+                // Terminals are session-restored, not repositioned — Windows exposes no
+                // reliable way to map a terminal window back to its captured shell.
+                && classify::classify(&window.exe_path, true) != Category::Terminal
         })
         .collect();
     let mut consumed: HashSet<isize> = HashSet::new();
@@ -595,12 +633,15 @@ pub fn restore_desktop(
     }
 
     // Soft warnings: windows we never managed to place, with a human-readable reason.
-    let mut warnings: Vec<String> = pending.iter().map(|w| unplaced_reason(w)).collect();
+    let mut warnings = explorer_outcome.warnings;
+    warnings.extend(pending.iter().map(|w| unplaced_reason(w)));
 
     // ── 4. Optional clean-up: close windows that aren't part of this snapshot ──────────
     // Terminals closed during reconciliation (clean restore only) are reported too.
     let mut closed_items = term_closed;
+    closed_items.extend(terminal_closed);
     closed_items.extend(vscode_closed);
+    closed_items.extend(explorer_outcome.closed_items);
     if close_others {
         let (closed, leftover) =
             close_windows_not_in_snapshot(snapshot, ignore_list, companion_managed_browsers);
@@ -728,6 +769,19 @@ pub fn exe_stem_pub(exe_path: &str) -> String {
     exe_stem(exe_path)
 }
 
+/// Store/UWP apps live under a locked-down `%ProgramFiles%\WindowsApps` path that
+/// CreateProcess cannot execute directly — spawning the raw exe returns "Access is
+/// denied" (os error 5). Map the known ones to their App Execution Alias, which is
+/// on PATH and launches correctly. Returns `None` for normally-launchable exes.
+#[cfg(windows)]
+fn store_app_launch_alias(exe_path: &str) -> Option<&'static str> {
+    if exe_stem(exe_path).eq_ignore_ascii_case("windowsterminal") {
+        Some("wt.exe")
+    } else {
+        None
+    }
+}
+
 /// Lowercase exe stems of every app that currently owns a visible window.
 /// Used to compare the live desktop against saved snapshots.
 #[cfg(windows)]
@@ -736,6 +790,7 @@ pub fn current_app_set() -> std::collections::HashSet<String> {
         .iter()
         .filter(|w| !w.exe.is_empty())
         .map(|w| exe_stem(&w.exe))
+        .filter(|stem| !crate::config::SYSTEM_PROTECTED.contains(&stem.as_str()))
         .collect()
 }
 
@@ -750,6 +805,11 @@ pub fn current_app_set() -> std::collections::HashSet<String> {
 fn launch(exe_path: &str, cmd_line: &str, classification: &str) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
+
+    // Store/UWP apps (e.g. Windows Terminal) can't be CreateProcess'd from their
+    // locked-down %ProgramFiles%\WindowsApps path (Access denied / os error 5).
+    // Launch via the app's execution alias, which is on PATH, instead.
+    let effective_exe = store_app_launch_alias(exe_path).unwrap_or(exe_path);
 
     // Args = everything in the recorded command line after argv[0].
     let mut args = crate::tokenize(cmd_line);
@@ -771,7 +831,7 @@ fn launch(exe_path: &str, cmd_line: &str, classification: &str) -> Result<(), St
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
 
-    Command::new(exe_path)
+    Command::new(effective_exe)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -780,6 +840,183 @@ fn launch(exe_path: &str, cmd_line: &str, classification: &str) -> Result<(), St
         .spawn()
         .map(|_child| ()) // detach: drop the handle, let it run independently
         .map_err(|e| e.to_string())
+}
+
+/// Launch an interactive shell so it opens a visible terminal window.
+///
+/// We go through `ShellExecuteW` ("open") rather than a raw `CREATE_NEW_CONSOLE`
+/// `CreateProcess`. This app is a GUI process with no console of its own; when it
+/// hand-rolls a new console for the shell, Win11's default-terminal handoff to Windows
+/// Terminal drops that console mid-handoff and the shell tears down a second later
+/// (the "window flashes then closes" bug). `ShellExecuteW` launches the shell exactly
+/// as the OS does from Win+R — a real interactive console, correct DefTerm handoff — so
+/// the shell stays open. It works for GUI launchers (git-bash.exe) too. `new_console`
+/// is no longer needed (the OS decides hosting) but kept for signature stability.
+#[cfg(windows)]
+fn launch_terminal(exe_path: &str, cmd_line: &str, _new_console: bool) -> Result<(), String> {
+    use windows::core::{w, HSTRING, PCWSTR};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    // Parameters = cmd_line minus its leading quoted argv[0] (the exe), keeping the
+    // original quoting of the rest (paths with spaces, the .ps1 path, cd targets).
+    let params = params_after_argv0(cmd_line);
+    let file = HSTRING::from(exe_path);
+    let params_w = HSTRING::from(params.as_str());
+
+    let result = unsafe {
+        ShellExecuteW(
+            HWND(std::ptr::null_mut()),
+            w!("open"),
+            PCWSTR(file.as_ptr()),
+            PCWSTR(params_w.as_ptr()),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecuteW returns an HINSTANCE; > 32 means success, ≤ 32 is an error code.
+    let code = result.0 as isize;
+    if code > 32 {
+        Ok(())
+    } else {
+        Err(format!("ShellExecuteW failed (code {code})"))
+    }
+}
+
+/// The parameter string for `ShellExecuteW`: everything after the leading quoted `"exe"`
+/// token in a restore cmd_line, with the remaining args' quoting preserved.
+#[cfg(windows)]
+fn params_after_argv0(cmd_line: &str) -> String {
+    let s = cmd_line.trim_start();
+    if let Some(rest) = s.strip_prefix('"') {
+        if let Some(close) = rest.find('"') {
+            return rest[close + 1..].trim_start().to_string();
+        }
+    }
+    s.split_once(char::is_whitespace)
+        .map(|(_, r)| r.to_string())
+        .unwrap_or_default()
+}
+
+/// The reconcile decision for a terminal restore, computed by `plan_terminal_reconcile`
+/// and executed by `restore_terminal_sessions`. Split out so the matching logic can be
+/// unit-tested without spawning or killing real processes.
+#[cfg(windows)]
+struct TerminalPlan {
+    /// Indices into `sessions` that have no matching live shell and must be relaunched.
+    launch: Vec<usize>,
+    /// PIDs of live shells that match no captured session — closed on a clean restore.
+    close_pids: Vec<u32>,
+}
+
+/// Reconcile the captured terminal sessions against the shells currently open.
+///
+/// A captured session and a live shell are "the same terminal" when they share a shell
+/// type *and* a working directory (folder compared case-insensitively, trailing
+/// separators ignored). For each captured session:
+///   • an identical live shell exists → keep it, don't relaunch (claims that shell);
+///   • otherwise → relaunch the session fresh at its saved cwd + history.
+/// On a clean restore (`close_others`), every live shell left unclaimed — i.e. one the
+/// snapshot doesn't contain — is marked for closing, except protected PIDs (this app and
+/// its launching terminal). A plain restore never closes anything.
+///
+/// Note: PowerShell's process CWD reads as its *launch* dir, not where it `cd`'d, so a
+/// PS session captured with a real cwd usually won't match a live PS and will relaunch —
+/// intended (a fresh window at the right dir beats keeping one at the wrong dir). cmd and
+/// git-bash update their real process CWD, so those match exactly.
+#[cfg(windows)]
+fn plan_terminal_reconcile(
+    sessions: &[crate::TerminalSession],
+    live: &[crate::terminal::RunningShell],
+    protected: &std::collections::HashSet<u32>,
+    close_others: bool,
+) -> TerminalPlan {
+    use std::collections::HashSet;
+
+    let norm = |s: &str| s.trim_end_matches('\\').to_ascii_lowercase();
+    let mut claimed: HashSet<u32> = HashSet::new();
+    let mut launch = Vec::new();
+
+    for (i, s) in sessions.iter().enumerate() {
+        let matched = live.iter().find(|r| {
+            !claimed.contains(&r.pid)
+                && !s.cwd.is_empty()
+                && r.shell.eq_ignore_ascii_case(&s.shell)
+                && norm(&r.cwd) == norm(&s.cwd)
+        });
+        match matched {
+            Some(r) => {
+                claimed.insert(r.pid); // unchanged terminal already open — keep it
+            }
+            None => launch.push(i),
+        }
+    }
+
+    let close_pids = if close_others {
+        live.iter()
+            .filter(|r| !claimed.contains(&r.pid) && !protected.contains(&r.pid))
+            .map(|r| r.pid)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    TerminalPlan { launch, close_pids }
+}
+
+/// Restore terminals by reconciling the captured interactive-shell sessions against the
+/// shells currently open (see `plan_terminal_reconcile`). Unchanged terminals are left
+/// alone; missing ones are relaunched directly at their saved cwd (and history, for
+/// PowerShell/bash) — Win11 re-hosts each in Windows Terminal. On a clean restore, live
+/// terminals the snapshot doesn't contain are closed so the desktop ends up with exactly
+/// the captured set. Window position and tab layout are not restored (no reliable OS map).
+#[cfg(windows)]
+fn restore_terminal_sessions(
+    sessions: &[crate::TerminalSession],
+    close_others: bool,
+    failed_items: &mut Vec<String>,
+    closed_items: &mut Vec<String>,
+) {
+    if sessions.is_empty() && !close_others {
+        return;
+    }
+
+    let live = crate::terminal::running_interactive_shells();
+    let protected = self_and_ancestor_pids();
+    let plan = plan_terminal_reconcile(sessions, &live, &protected, close_others);
+
+    if !plan.launch.is_empty() {
+        let temp_dir = std::env::temp_dir().join("pc_snapshot_restore");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        for (n, &i) in plan.launch.iter().enumerate() {
+            let s = &sessions[i];
+            let Some(cmd) = crate::terminal::terminal_launch_cmd(&s.exe, s, &temp_dir, n + 1) else {
+                continue; // e.g. a shell with no saved cwd — nothing to restore
+            };
+            let new_console = !s.shell.eq_ignore_ascii_case("git_bash");
+            if let Err(e) = launch_terminal(&cmd.exe_path, &cmd.cmd_line, new_console) {
+                failed_items.push(format!(
+                    "Terminal ({}) could not be launched ({e})",
+                    s.shell
+                ));
+            }
+        }
+    }
+
+    // Clean restore: close the terminals that aren't part of this snapshot. Terminating
+    // the shell process is the reliable close — a console window is owned by conhost/WT,
+    // not the shell, so it has no window of its own to WM_CLOSE; when the shell exits its
+    // host window closes with it. This discards any unsaved state in that terminal.
+    for r in &live {
+        if plan.close_pids.contains(&r.pid) && terminate_pid(r.pid) {
+            closed_items.push(if r.cwd.is_empty() {
+                format!("terminal ({})", r.shell)
+            } else {
+                format!("terminal ({} @ {})", r.shell, r.cwd)
+            });
+        }
+    }
 }
 
 // ── Live window inspection ────────────────────────────────────────────────────────────
@@ -1103,13 +1340,17 @@ fn close_windows_not_in_snapshot(
 
     let live = live_windows();
 
-    // Set A: windows whose exe is not part of the snapshot at all.
+    // Set A: windows whose exe is not part of the snapshot at all. Terminals are
+    // excluded here and handled exclusively by the process-based terminal pass (which
+    // reconciles by shell+cwd and terminates the shell); otherwise this window-level
+    // pass could close the conhost/WT window hosting a terminal that pass just relaunched.
     let mut targets: Vec<LiveWindow> = live
         .iter()
         .filter(|w| {
             let stem = exe_stem(&w.exe);
             !w.exe.is_empty()
                 && !keep.contains(&stem)
+                && classify::classify(&w.exe, true) != Category::Terminal
                 && !(companion_managed_browsers && classify::classify(&w.exe, true).is_browser())
                 && !protected.contains(&stem)
                 && !protected_pids.contains(&w.pid)
@@ -1265,10 +1506,14 @@ fn terminate_pid(pid: u32) -> bool {
 pub fn close_all_windows(ignore_list: &[String]) -> (Vec<String>, Vec<String>) {
     let empty = Snapshot {
         schema_version: 2, id: String::new(), name: String::new(), timestamp: String::new(),
-        processes: vec![], windows: vec![], context_clues: vec![], restore_hints: vec![],
+        processes: vec![], windows: vec![], explorer_windows: vec![], context_clues: vec![], restore_hints: vec![],
         warnings: vec![], thumbnail_path: String::new(), terminal_sessions: vec![], browser_sessions: vec![],
     };
-    close_windows_not_in_snapshot(&empty, ignore_list, false)
+    let (mut closed, mut leftover) = close_windows_not_in_snapshot(&empty, ignore_list, false);
+    let (explorer_closed, explorer_leftover) = crate::explorer::close_all_folder_windows();
+    closed.extend(explorer_closed);
+    leftover.extend(explorer_leftover);
+    (closed, leftover)
 }
 
 #[cfg(not(windows))]
@@ -1334,7 +1579,7 @@ fn extra_window_launch_count(
 fn terminal_restore_cmd(
     snapshot: &Snapshot,
     proc_: &crate::ProcessInfo,
-    indices: &mut std::collections::HashMap<String, usize>,
+    used: &mut std::collections::HashMap<String, Vec<usize>>,
     window_title: Option<&str>,
 ) -> Option<crate::terminal::TerminalLaunch> {
     if snapshot.terminal_sessions.is_empty() {
@@ -1351,37 +1596,38 @@ fn terminal_restore_cmd(
     if sessions_for_exe.is_empty() {
         return None;
     }
-    let index = indices
-        .entry(proc_.exe_path.to_ascii_lowercase())
-        .or_insert(0);
 
-    // Try to match by window title first (exact, then substring).
-    let session = if let Some(title) = window_title.filter(|t| !t.is_empty()) {
-        sessions_for_exe
-            .iter()
-            .find(|(_, s)| s.window_title == title)
-            .or_else(|| {
-                sessions_for_exe.iter().find(|(_, s)| {
-                    s.window_title.len() >= 4
-                        && title.len() >= 4
-                        && (s.window_title.contains(title)
-                            || title.contains(s.window_title.as_str()))
+    // Pick an as-yet-unconsumed session for this window. Terminal windows frequently
+    // share a generic title ("Windows PowerShell"), so a title match alone collapses
+    // several windows onto the same session — and thus the same CWD. Prefer a title
+    // match among *unconsumed* sessions, then fall back to the next unconsumed one in
+    // order, so each restored window keeps its own captured directory.
+    let consumed = used.entry(proc_.exe_path.to_ascii_lowercase()).or_default();
+    let pos = window_title
+        .filter(|t| !t.is_empty())
+        .and_then(|title| {
+            (0..sessions_for_exe.len())
+                .find(|&i| !consumed.contains(&i) && sessions_for_exe[i].1.window_title == title)
+                .or_else(|| {
+                    (0..sessions_for_exe.len()).find(|&i| {
+                        !consumed.contains(&i) && {
+                            let wt = &sessions_for_exe[i].1.window_title;
+                            wt.len() >= 4
+                                && title.len() >= 4
+                                && (wt.contains(title) || title.contains(wt.as_str()))
+                        }
+                    })
                 })
-            })
-            .map(|(_, s)| *s)
-            // Fall back to sequential index if title didn't match any session.
-            .or_else(|| sessions_for_exe.get(*index).map(|(_, s)| *s))
-    } else {
-        sessions_for_exe.get(*index).map(|(_, s)| *s)
-    };
+        })
+        .or_else(|| (0..sessions_for_exe.len()).find(|&i| !consumed.contains(&i)))?;
+    consumed.push(pos);
+    let unique_index = consumed.len();
 
-    *index += 1;
-
-    let session = session?;
+    let session = sessions_for_exe[pos].1;
     let temp_dir = std::env::temp_dir().join("pc_snapshot_restore");
     let _ = std::fs::create_dir_all(&temp_dir);
 
-    crate::terminal::terminal_launch_cmd(&proc_.exe_path, session, &temp_dir, *index)
+    crate::terminal::terminal_launch_cmd(&proc_.exe_path, session, &temp_dir, unique_index)
 }
 
 /// Captured active-tab URLs for a browser, in snapshot order, de-duplicated.
@@ -1404,12 +1650,159 @@ fn browser_urls_for(snapshot: &Snapshot, stem: &str) -> Vec<String> {
 
 #[cfg(all(windows, test))]
 mod tests {
-    use super::{extra_window_launch_count, surplus_close_indices, terminal_restore_cmd};
+    use super::{
+        extra_window_launch_count, plan_terminal_reconcile, store_app_launch_alias,
+        surplus_close_indices, terminal_restore_cmd,
+    };
+    use crate::terminal::RunningShell;
     use crate::{ProcessInfo, Snapshot, TerminalSession};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     fn v(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn term(shell: &str, cwd: &str) -> TerminalSession {
+        TerminalSession {
+            shell: shell.to_string(),
+            cwd: cwd.to_string(),
+            history: vec![],
+            window_title: String::new(),
+            inner_shell: String::new(),
+            exe: format!("{shell}.exe"),
+        }
+    }
+
+    fn shell(pid: u32, shell: &str, cwd: &str) -> RunningShell {
+        RunningShell { pid, shell: shell.to_string(), cwd: cwd.to_string() }
+    }
+
+    #[test]
+    fn terminal_reconcile_keeps_unchanged_relaunches_missing_closes_extras() {
+        // Captured: cmd@C:\a and powershell@C:\b.
+        let sessions = vec![term("cmd", r"C:\a"), term("powershell", r"C:\b")];
+        let live = vec![
+            shell(10, "cmd", r"C:\a\"),         // same as session 0 (trailing sep normalized) → keep
+            shell(20, "cmd", r"C:\other"),      // not in snapshot → close on clean restore
+            shell(30, "powershell", r"C:\b"),   // PS live cwd == session 1's cwd → keep
+            shell(40, "powershell", r"C:\zzz"), // not in snapshot → close
+        ];
+        let protected = HashSet::new();
+        let plan = plan_terminal_reconcile(&sessions, &live, &protected, true);
+        assert!(plan.launch.is_empty(), "both captured sessions had a live match");
+        let mut closed = plan.close_pids.clone();
+        closed.sort_unstable();
+        assert_eq!(closed, vec![20, 40]);
+    }
+
+    #[test]
+    fn terminal_reconcile_relaunches_when_no_live_match() {
+        let sessions = vec![term("cmd", r"C:\proj")];
+        let live = vec![shell(10, "cmd", r"C:\somewhere\else")];
+        let plan = plan_terminal_reconcile(&sessions, &live, &HashSet::new(), true);
+        assert_eq!(plan.launch, vec![0]); // no cwd match → relaunch the captured session
+        assert_eq!(plan.close_pids, vec![10]); // the mismatched live cmd is closed
+    }
+
+    #[test]
+    fn terminal_reconcile_plain_restore_never_closes_and_protects_own_tree() {
+        let sessions = vec![term("cmd", r"C:\a")];
+        let live = vec![shell(10, "cmd", r"C:\a"), shell(99, "powershell", r"C:\x")];
+        // Plain restore (close_others = false): keep the match, close nothing.
+        let plain = plan_terminal_reconcile(&sessions, &live, &HashSet::new(), false);
+        assert!(plain.launch.is_empty());
+        assert!(plain.close_pids.is_empty());
+        // Clean restore, but pid 99 is our own launching terminal → never closed.
+        let mut protected = HashSet::new();
+        protected.insert(99u32);
+        let clean = plan_terminal_reconcile(&sessions, &live, &protected, true);
+        assert!(clean.close_pids.is_empty());
+    }
+
+    #[test]
+    fn terminal_reconcile_one_live_shell_satisfies_only_one_session() {
+        // Two identical captured sessions, one live shell: keep one, relaunch the other.
+        let sessions = vec![term("cmd", r"C:\a"), term("cmd", r"C:\a")];
+        let live = vec![shell(10, "cmd", r"C:\a")];
+        let plan = plan_terminal_reconcile(&sessions, &live, &HashSet::new(), true);
+        assert_eq!(plan.launch, vec![1]); // first claims pid 10; second has no match
+        assert!(plan.close_pids.is_empty());
+    }
+
+    #[test]
+    fn windows_terminal_maps_to_wt_alias_not_the_locked_windowsapps_path() {
+        // The reported bug: WindowsTerminal.exe under WindowsApps can't be launched
+        // by path (os error 5) — it must go through the wt.exe execution alias.
+        assert_eq!(
+            store_app_launch_alias(
+                r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.21.0_x64__8wekyb3d8bbwe\WindowsTerminal.exe"
+            ),
+            Some("wt.exe")
+        );
+        // Case-insensitive on the stem.
+        assert_eq!(store_app_launch_alias(r"D:\x\windowsterminal.exe"), Some("wt.exe"));
+        // Normally-launchable exes are left alone.
+        assert_eq!(
+            store_app_launch_alias(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            None
+        );
+        assert_eq!(store_app_launch_alias(r"C:\Program Files\Git\usr\bin\mintty.exe"), None);
+    }
+
+    fn wt_snapshot(cwds: &[&str]) -> (Snapshot, ProcessInfo) {
+        let terminal_sessions = cwds
+            .iter()
+            .map(|c| TerminalSession {
+                shell: "windows_terminal".to_string(),
+                cwd: c.to_string(),
+                history: vec![],
+                window_title: "Windows PowerShell".to_string(), // shared, generic title
+                inner_shell: String::new(), // exercises the wt -d fallback path
+                exe: String::new(),
+            })
+            .collect();
+        let snap = Snapshot {
+            schema_version: 3,
+            id: "t".into(),
+            name: "t".into(),
+            timestamp: "t".into(),
+            processes: vec![],
+            windows: vec![],
+            explorer_windows: vec![],
+            context_clues: vec![],
+            restore_hints: vec![],
+            warnings: vec![],
+            thumbnail_path: String::new(),
+            terminal_sessions,
+            browser_sessions: vec![],
+        };
+        let proc_ = ProcessInfo {
+            name: "WindowsTerminal.exe".into(),
+            pid: 1,
+            exe_path: r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_x\WindowsTerminal.exe"
+                .into(),
+            cmd_line: String::new(),
+            classification: "terminal".into(),
+        };
+        (snap, proc_)
+    }
+
+    #[test]
+    fn same_titled_terminal_windows_get_distinct_cwds() {
+        // The reported bug: several WT windows all titled "Windows PowerShell" must NOT
+        // collapse onto one session's CWD — each keeps its own captured directory.
+        let (snap, proc_) =
+            wt_snapshot(&[r"C:\a\ozonetel work", r"C:\a\PC Snapshot", r"C:\a\projects"]);
+        let mut used = HashMap::new();
+        let title = Some("Windows PowerShell");
+        let c1 = terminal_restore_cmd(&snap, &proc_, &mut used, title).expect("cmd1");
+        let c2 = terminal_restore_cmd(&snap, &proc_, &mut used, title).expect("cmd2");
+        let c3 = terminal_restore_cmd(&snap, &proc_, &mut used, title).expect("cmd3");
+        assert!(c1.cmd_line.contains("ozonetel work"), "c1: {}", c1.cmd_line);
+        assert!(c2.cmd_line.contains(r"\PC Snapshot"), "c2: {}", c2.cmd_line);
+        assert!(c3.cmd_line.contains(r"\projects"), "c3: {}", c3.cmd_line);
+        // New-window invocation so the -d directory is actually honored.
+        assert!(c1.cmd_line.contains("-w new -d"), "c1: {}", c1.cmd_line);
     }
 
     #[test]
@@ -1485,6 +1878,7 @@ mod tests {
             timestamp: String::new(),
             processes: vec![powershell.clone(), git.clone()],
             windows: vec![],
+            explorer_windows: vec![],
             context_clues: vec![],
             restore_hints: vec![],
             warnings: vec![],
@@ -1495,12 +1889,16 @@ mod tests {
                     cwd: r"C:\Windows".to_string(),
                     history: vec![],
                     window_title: "Windows PowerShell".to_string(),
+                    inner_shell: String::new(),
+                    exe: String::new(),
                 },
                 TerminalSession {
                     shell: "git_bash".to_string(),
                     cwd: r"C:\repo".to_string(),
                     history: vec![],
                     window_title: "MINGW64:/c/repo".to_string(),
+                    inner_shell: String::new(),
+                    exe: String::new(),
                 },
             ],
             browser_sessions: vec![],

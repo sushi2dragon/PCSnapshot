@@ -33,62 +33,126 @@ const MAX_HISTORY_LINES: usize = 50;
 /// owning PID per window so each window maps to *its* process — matching by
 /// exe path instead would fan every powershell window across every powershell
 /// process (an N×M cross-product with cross-assigned CWDs).
+/// Capture the interactive shell *processes* the user opened, reading each one's
+/// working directory straight from the process. This sidesteps the unsolvable
+/// "which Windows Terminal window hosts which shell" mapping: a Win+R cmd adopted
+/// into WT via the Win11 default-terminal handoff isn't reachable from the WT
+/// window, but the shell process itself always is. Window position and tab grouping
+/// are intentionally not restored (Windows exposes no reliable way to recover them).
+///
+/// PowerShell keeps its location in-runspace, so its process CWD reads as the launch
+/// dir; the opt-in profile hook (terminal_hook.rs) is the way to capture a PS that
+/// cd'd. `cmd` and `bash` update their real process CWD, so those are exact.
 #[cfg(windows)]
 pub fn capture_terminal_sessions(
     processes: &[ProcessInfo],
     windows: &[(u32, WindowInfo)],
 ) -> Vec<TerminalSession> {
+    let tree = ProcTree::snapshot();
     let mut sessions = Vec::new();
 
-    // Built once, on the first terminal window: a process-tree snapshot used to
-    // find the shell that actually backs each window (see resolve_shell_cwd).
-    // `claimed` stops two windows from mapping to the same shell process.
-    let mut tree: Option<ProcTree> = None;
-    let mut claimed: HashSet<u32> = HashSet::new();
-
-    for (pid, win) in windows {
-        let Some(proc_) = processes.iter().find(|p| p.pid == *pid) else {
-            continue;
+    for pid in tree.interactive_shells() {
+        let exe_path = tree.exe_of(pid);
+        let (shell, launch_exe) = match tree.stem_of(pid).as_str() {
+            "powershell" => ("powershell", "powershell.exe".to_string()),
+            "pwsh" => ("pwsh", "pwsh.exe".to_string()),
+            "cmd" => ("cmd", "cmd.exe".to_string()),
+            "bash" => match git_bash_launcher_path(&exe_path) {
+                Some(launcher) => ("git_bash", launcher.to_string_lossy().into_owned()),
+                None => continue, // a bash we can't relaunch (e.g. WSL) — skip
+            },
+            _ => continue,
         };
-        let cat = if proc_.classification == "foreground" {
-            classify::classify(&proc_.exe_path, true)
-        } else {
-            Category::from_str(&proc_.classification)
-        };
-        if cat != Category::Terminal {
-            continue;
-        }
 
-        let shell = shell_type(&proc_.exe_path);
-        let history = read_terminal_history(shell);
-
-        // Resolution order, best → worst:
-        //   1. Window title, when it holds an absolute path. This is the ONLY
-        //      way to get a PowerShell's *live* directory: PS keeps its location
-        //      in-runspace and never writes it to the process CWD, so the OS read
-        //      below returns the launch dir, not where the user cd'd. The opt-in
-        //      profile hook (see terminal_hook.rs) mirrors $PWD into the title so
-        //      this branch becomes authoritative.
-        //   2. The backing shell's process CWD from the OS — correct for cmd and
-        //      for any shell that never cd'd after launch.
-        //   3. Windows Terminal's `-d <path>` startup flag.
-        let cwd = if let Some(c) = cwd_from_title(&win.title) {
-            c
+        // cmd keeps no history file; its per-session buffer is read from the live console.
+        // powershell/pwsh use the (global) PSReadLine file. git_bash handled below.
+        let history = if shell == "cmd" {
+            read_cmd_console_history(pid)
         } else {
-            let tree_ref = tree.get_or_insert_with(ProcTree::snapshot);
-            resolve_shell_cwd(*pid, shell, tree_ref, &mut claimed)
-                .or_else(|| cwd_from_cmdline(&proc_.cmd_line))
-                .unwrap_or_default()
+            read_terminal_history(shell)
         };
 
         sessions.push(TerminalSession {
             shell: shell.to_string(),
-            cwd,
-            history: history.clone(),
-            window_title: win.title.clone(),
+            cwd: cwd_for_pid(pid).unwrap_or_default(),
+            history,
+            window_title: String::new(),
+            inner_shell: String::new(),
+            exe: launch_exe,
         });
     }
+
+    // Git Bash can't be found via the process tree: mintty's bash child routinely has a
+    // severed parent link (its recorded parent PID points at an already-exited process),
+    // so `interactive_shells()` never sees it. Recover it from the mintty *window* title
+    // instead, which encodes the MSYS cwd (e.g. "MINGW64:/c/Users/…"). The git-bash
+    // launcher comes from the owning mintty's exe path. Dedup against any bash the process
+    // walk did find so a single terminal isn't captured twice.
+    let pid_to_exe: HashMap<u32, &str> =
+        processes.iter().map(|p| (p.pid, p.exe_path.as_str())).collect();
+    for (pid, w) in windows {
+        let Some(cwd) = git_bash_cwd_from_title(&w.title) else {
+            continue;
+        };
+        if sessions
+            .iter()
+            .any(|s| s.shell == "git_bash" && s.cwd.eq_ignore_ascii_case(&cwd))
+        {
+            continue; // already captured via the process walk
+        }
+        let owner_exe = pid_to_exe.get(pid).copied().unwrap_or("");
+        let launch_exe = git_bash_launcher_path(owner_exe)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| owner_exe.to_string());
+        if launch_exe.is_empty() {
+            continue; // no way to relaunch it
+        }
+        sessions.push(TerminalSession {
+            shell: "git_bash".to_string(),
+            cwd,
+            history: read_terminal_history("git_bash"),
+            window_title: w.title.clone(),
+            inner_shell: String::new(),
+            exe: launch_exe,
+        });
+    }
+
     sessions
+}
+
+/// A currently-running interactive shell: its PID, restore shell type
+/// (cmd/powershell/pwsh/git_bash), and working directory. Restore reconciles these
+/// against the captured sessions to decide what to keep, relaunch, or close.
+#[cfg(windows)]
+pub struct RunningShell {
+    pub pid: u32,
+    pub shell: String,
+    pub cwd: String,
+}
+
+/// Enumerate the interactive shells the user currently has open, each with the
+/// working directory read straight from its process. Uses the same discovery and
+/// CWD source as `capture_terminal_sessions`, so a live shell compares like-for-like
+/// against a captured session (same shell type + same cwd ⇒ "unchanged").
+#[cfg(windows)]
+pub fn running_interactive_shells() -> Vec<RunningShell> {
+    let tree = ProcTree::snapshot();
+    let mut out = Vec::new();
+    for pid in tree.interactive_shells() {
+        let shell = match tree.stem_of(pid).as_str() {
+            "powershell" => "powershell",
+            "pwsh" => "pwsh",
+            "cmd" => "cmd",
+            "bash" if git_bash_launcher_path(&tree.exe_of(pid)).is_some() => "git_bash",
+            _ => continue,
+        };
+        out.push(RunningShell {
+            pid,
+            shell: shell.to_string(),
+            cwd: cwd_for_pid(pid).unwrap_or_default(),
+        });
+    }
+    out
 }
 
 /// Find the working directory of the shell backing a terminal window. The shell
@@ -100,27 +164,41 @@ pub fn capture_terminal_sessions(
 /// so we try self, then parent, then descendants. `claimed` prevents two windows
 /// (e.g. two WT tabs under one host) from resolving to the same shell.
 #[cfg(windows)]
+/// Returns `(cwd, inner_shell_stem)` for the shell backing the window. The stem
+/// (cmd/powershell/pwsh/…) lets a Windows Terminal window record which shell runs
+/// inside it, since the window's own exe is just WindowsTerminal.exe.
 fn resolve_shell_cwd(
     owner_pid: u32,
     shell_kind: &str,
     tree: &ProcTree,
     claimed: &mut HashSet<u32>,
-) -> Option<String> {
+) -> Option<(String, String)> {
     // The window's own process is the shell.
     if matches!(shell_kind, "powershell" | "pwsh" | "cmd") {
         claimed.insert(owner_pid);
-        return cwd_for_pid(owner_pid);
+        return cwd_for_pid(owner_pid).map(|c| (c, shell_kind.to_string()));
     }
     // The shell is the parent (classic conhost-hosted console).
     if let Some(par) = tree.parent(owner_pid) {
         if tree.is_shell(par) && claimed.insert(par) {
-            return cwd_for_pid(par);
+            return cwd_for_pid(par).map(|c| (c, tree.stem_of(par)));
         }
     }
     // The shell is a descendant (Windows Terminal → OpenConsole → shell).
     if let Some(shell_pid) = tree.first_shell_descendant(owner_pid, claimed) {
         claimed.insert(shell_pid);
-        return cwd_for_pid(shell_pid);
+        return cwd_for_pid(shell_pid).map(|c| (c, tree.stem_of(shell_pid)));
+    }
+    // Windows 11 default-terminal handoff: a console started outside WT (Win+R "cmd",
+    // Start-menu, double-click) is adopted into a Windows Terminal window, but the
+    // shell process stays a child of explorer.exe — NOT a descendant of
+    // WindowsTerminal.exe — so the descendant walk above can't see it. Best-effort:
+    // claim the lowest-PID unclaimed shell launched by the shell (parent = explorer).
+    if shell_kind == "windows_terminal" {
+        if let Some(shell_pid) = tree.first_adopted_console_shell(claimed) {
+            claimed.insert(shell_pid);
+            return cwd_for_pid(shell_pid).map(|c| (c, tree.stem_of(shell_pid)));
+        }
     }
     None
 }
@@ -134,6 +212,8 @@ struct ProcTree {
     parent: HashMap<u32, u32>,
     children: HashMap<u32, Vec<u32>>,
     stem: HashMap<u32, String>,
+    cmdline: HashMap<u32, String>,
+    exe: HashMap<u32, String>,
 }
 
 #[cfg(windows)]
@@ -147,6 +227,8 @@ impl ProcTree {
         let mut parent = HashMap::new();
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
         let mut stem = HashMap::new();
+        let mut cmdline = HashMap::new();
+        let mut exe = HashMap::new();
         for (pid, proc_) in sys.processes() {
             let pid_u = pid.as_u32();
             let name_cow = proc_.name().to_string_lossy();
@@ -157,17 +239,72 @@ impl ProcTree {
                 .unwrap_or(name)
                 .to_ascii_lowercase();
             stem.insert(pid_u, s);
+            let cl = proc_
+                .cmd()
+                .iter()
+                .map(|a| a.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ");
+            cmdline.insert(pid_u, cl);
+            if let Some(path) = proc_.exe() {
+                exe.insert(pid_u, path.to_string_lossy().into_owned());
+            }
             if let Some(par) = proc_.parent() {
                 let par_u = par.as_u32();
                 parent.insert(pid_u, par_u);
                 children.entry(par_u).or_default().push(pid_u);
             }
         }
-        ProcTree { parent, children, stem }
+        ProcTree { parent, children, stem, cmdline, exe }
     }
 
     fn parent(&self, pid: u32) -> Option<u32> {
         self.parent.get(&pid).copied()
+    }
+
+    fn stem_of(&self, pid: u32) -> String {
+        self.stem.get(&pid).cloned().unwrap_or_default()
+    }
+
+    fn exe_of(&self, pid: u32) -> String {
+        self.exe.get(&pid).cloned().unwrap_or_default()
+    }
+
+    /// True when a shell was launched to run a command and exit (a build tool, script,
+    /// or the harness) rather than an interactive session the user is typing into.
+    fn is_run_and_exit(&self, pid: u32) -> bool {
+        let cl = self.cmdline.get(&pid).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+        cl.contains("/c ")
+            || cl.contains("/s /c")
+            || cl.contains("-command")
+            || cl.contains("-encodedcommand")
+            || cl.contains("-file ")
+            || cl.contains("--headless")
+    }
+
+    /// PIDs of the interactive shells the user actually opened: a cmd/powershell/pwsh/
+    /// bash whose parent is a shell launcher (explorer / a terminal host) and whose
+    /// command line isn't a run-and-exit command. Excludes build tools and harness
+    /// shells (children of node/chrome/the app), which is verified against real
+    /// process trees. Sorted for stable ordering.
+    fn interactive_shells(&self) -> Vec<u32> {
+        const LAUNCHERS: &[&str] =
+            &["explorer", "windowsterminal", "openconsole", "conhost", "wt", "mintty"];
+        let mut out: Vec<u32> = self
+            .stem
+            .iter()
+            .filter(|(pid, s)| {
+                matches!(s.as_str(), "cmd" | "powershell" | "pwsh" | "bash")
+                    && self
+                        .parent(**pid)
+                        .map(|par| LAUNCHERS.contains(&self.stem_of(par).as_str()))
+                        .unwrap_or(false)
+                    && !self.is_run_and_exit(**pid)
+            })
+            .map(|(pid, _)| *pid)
+            .collect();
+        out.sort_unstable();
+        out
     }
 
     fn is_shell(&self, pid: u32) -> bool {
@@ -199,6 +336,27 @@ impl ProcTree {
             }
         }
         best
+    }
+
+    /// Lowest-PID unclaimed shell whose parent is explorer.exe — a console that
+    /// Windows 11's default-terminal handoff adopted into Windows Terminal without
+    /// reparenting it under WindowsTerminal.exe. Used only after the descendant walk
+    /// fails for a WT window, so standalone consoles (matched via self/parent) are
+    /// already claimed and won't be grabbed here.
+    fn first_adopted_console_shell(&self, claimed: &HashSet<u32>) -> Option<u32> {
+        self.stem
+            .keys()
+            .copied()
+            .filter(|&pid| {
+                !claimed.contains(&pid)
+                    && self.is_shell(pid)
+                    && self
+                        .parent(pid)
+                        .and_then(|par| self.stem.get(&par))
+                        .map(|s| s == "explorer")
+                        .unwrap_or(false)
+            })
+            .min()
     }
 }
 
@@ -465,6 +623,63 @@ fn cwd_from_cmdline(cmd_line: &str) -> Option<String> {
     None
 }
 
+/// Read a running cmd.exe's in-memory command history — what `doskey /history` shows.
+/// cmd keeps no history file, but the console server holds the buffer, so we briefly
+/// attach to the target's console and call `GetConsoleCommandHistoryW` (undocumented but
+/// name-exported from kernel32 and stable for decades — the very API doskey uses). Works
+/// through Windows Terminal's ConPTY (verified on-device). Best-effort: returns empty on
+/// any failure. `AttachConsole` is process-global, so we `FreeConsole` before and after.
+#[cfg(windows)]
+fn read_cmd_console_history(pid: u32) -> Vec<String> {
+    use windows::core::{s, w};
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+
+    type AttachFn = unsafe extern "system" fn(u32) -> i32;
+    type FreeFn = unsafe extern "system" fn() -> i32;
+    type LenFn = unsafe extern "system" fn(*const u16) -> u32;
+    type HistFn = unsafe extern "system" fn(*mut u16, u32, *const u16) -> u32;
+
+    unsafe {
+        let Ok(k32) = GetModuleHandleW(w!("kernel32.dll")) else {
+            return vec![];
+        };
+        let (Some(a), Some(f), Some(gl), Some(gh)) = (
+            GetProcAddress(k32, s!("AttachConsole")),
+            GetProcAddress(k32, s!("FreeConsole")),
+            GetProcAddress(k32, s!("GetConsoleCommandHistoryLengthW")),
+            GetProcAddress(k32, s!("GetConsoleCommandHistoryW")),
+        ) else {
+            return vec![];
+        };
+        let attach: AttachFn = std::mem::transmute(a);
+        let free: FreeFn = std::mem::transmute(f);
+        let get_len: LenFn = std::mem::transmute(gl);
+        let get_hist: HistFn = std::mem::transmute(gh);
+
+        let exe: Vec<u16> = "cmd.exe".encode_utf16().chain(std::iter::once(0)).collect();
+
+        free(); // drop any console we hold so AttachConsole can succeed
+        if attach(pid) == 0 {
+            return vec![];
+        }
+        let bytes = get_len(exe.as_ptr());
+        let out = if bytes == 0 {
+            vec![]
+        } else {
+            let mut buf = vec![0u16; (bytes as usize) / 2];
+            let got = get_hist(buf.as_mut_ptr(), bytes, exe.as_ptr());
+            let n = ((got as usize) / 2).min(buf.len());
+            buf[..n]
+                .split(|&c| c == 0)
+                .filter(|part| !part.is_empty())
+                .map(String::from_utf16_lossy)
+                .collect()
+        };
+        free();
+        out
+    }
+}
+
 #[cfg(windows)]
 fn read_psreadline_history() -> Vec<String> {
     let appdata = match std::env::var("APPDATA") {
@@ -543,21 +758,76 @@ pub fn terminal_launch_cmd(
             ))
         }
         "cmd" => {
-            if session.cwd.is_empty() {
+            if session.cwd.is_empty() && session.history.is_empty() {
                 None
             } else {
-                Some(format!("\"{}\" /K \"cd /d {}\"", exe_path, session.cwd))
+                // A .cmd script (run via /K, which keeps the window open) displays the
+                // captured history then cd's. History is dumped from a sidecar file with
+                // `type`, so command text isn't reparsed by the batch interpreter.
+                let script_path = temp_dir.join(format!("restore_terminal_{index}.cmd"));
+                let mut script = String::from("@echo off\r\n");
+                if !session.history.is_empty() {
+                    let history_path =
+                        temp_dir.join(format!("restore_terminal_{index}.history"));
+                    let body = session
+                        .history
+                        .iter()
+                        .map(|c| format!("  {c}"))
+                        .collect::<Vec<_>>()
+                        .join("\r\n");
+                    std::fs::write(&history_path, body).ok()?;
+                    script.push_str("echo(\r\n");
+                    script.push_str(
+                        "echo   --- Recent history (this cmd session, at capture) ---\r\n",
+                    );
+                    script.push_str(&format!("type \"{}\"\r\n", history_path.to_string_lossy()));
+                    script.push_str("echo(\r\n");
+                    script.push_str(
+                        "echo   ---------------------------------------------------\r\n",
+                    );
+                    script.push_str("echo(\r\n");
+                }
+                if !session.cwd.is_empty() {
+                    script.push_str(&format!("cd /d \"{}\"\r\n", session.cwd));
+                }
+                std::fs::write(&script_path, script).ok()?;
+                Some(format!(
+                    "\"{}\" /K \"{}\"",
+                    exe_path,
+                    script_path.to_string_lossy()
+                ))
             }
         }
         "windows_terminal" => {
-            // Windows Terminal's packaged UWP argument parsing doesn't reliably support
-            // chaining a PowerShell command via `-d <cwd> powershell -NoExit -File <script>`.
-            // Just restore the CWD via the `-d` flag; history display inside WT requires
-            // a different mechanism (WT settings profile or post-launch keystrokes).
-            if session.cwd.is_empty() {
-                None // fall back to the captured cmd_line which may already have -d
-            } else {
-                Some(format!("\"{}\" -d \"{}\"", exe_path, session.cwd))
+            // Relaunch the actual inner shell directly. On Windows 11 (default terminal =
+            // Windows Terminal) a launched powershell/cmd is auto-hosted in a WT window,
+            // and the shell's own startup restores cwd + history — WT itself can't be
+            // reliably handed a shell+script on its command line, and a bare `wt -d` sent
+            // to a running WT instance drops the directory. Falls back to `wt -w new -d`
+            // when the inner shell wasn't resolved at capture.
+            match session.inner_shell.as_str() {
+                "powershell" | "pwsh" => {
+                    let script_path = temp_dir.join(format!("restore_terminal_{index}.ps1"));
+                    std::fs::write(&script_path, build_ps_restore_script(session)).ok()?;
+                    return Some(TerminalLaunch {
+                        exe_path: format!("{}.exe", session.inner_shell),
+                        cmd_line: format!(
+                            "\"{}.exe\" -NoExit -ExecutionPolicy Bypass -File \"{}\"",
+                            session.inner_shell,
+                            script_path.to_string_lossy()
+                        ),
+                    });
+                }
+                "cmd" if !session.cwd.is_empty() => {
+                    return Some(TerminalLaunch {
+                        exe_path: "cmd.exe".to_string(),
+                        cmd_line: format!("\"cmd.exe\" /K \"cd /d {}\"", session.cwd),
+                    });
+                }
+                _ if !session.cwd.is_empty() => {
+                    Some(format!("\"{}\" -w new -d \"{}\"", exe_path, session.cwd))
+                }
+                _ => None,
             }
         }
         "git_bash" => {
@@ -598,19 +868,27 @@ pub fn terminal_launch_cmd(
     })
 }
 
-/// True when a saved terminal session belongs to the executable that owns the
-/// captured window. `unknown` is accepted for old Git Bash snapshots whose
-/// mintty titles still contain an authoritative MSYS working directory.
+/// True when a saved terminal session belongs to the executable the user selected
+/// for a per-app restore. Sessions are keyed by inner shell (powershell/pwsh/cmd/
+/// git_bash), but the selectable app is usually the *host* process that owns the
+/// window — WindowsTerminal.exe (or conhost) for the console shells, mintty for Git
+/// Bash — so a host selection must match all the shells it hosts. `unknown` is
+/// accepted for old Git Bash snapshots whose mintty titles still carry the cwd.
 pub fn session_matches_executable(session: &TerminalSession, exe_path: &str) -> bool {
-    let stem = executable_stem(exe_path);
-    matches!(
-        (effective_shell(session, exe_path), stem.as_str()),
-        ("powershell", "powershell")
-            | ("pwsh", "pwsh")
-            | ("cmd", "cmd")
-            | ("windows_terminal", "windowsterminal")
-            | ("git_bash", "mintty")
-    )
+    let shell = effective_shell(session, exe_path);
+    match executable_stem(exe_path).as_str() {
+        // A console host relaunches all of its console shells. `windows_terminal` is the
+        // legacy shell tag from schema-3 snapshots (kept so old snapshots still restore).
+        "windowsterminal" | "wt" | "conhost" | "openconsole" => {
+            matches!(shell, "powershell" | "pwsh" | "cmd" | "windows_terminal")
+        }
+        "mintty" => shell == "git_bash",
+        // A shell selected directly (the app list occasionally surfaces the shell exe).
+        "powershell" => shell == "powershell",
+        "pwsh" => shell == "pwsh",
+        "cmd" => shell == "cmd",
+        _ => false,
+    }
 }
 
 fn effective_shell<'a>(session: &'a TerminalSession, exe_path: &str) -> &'a str {
@@ -663,7 +941,7 @@ fn build_bash_restore_script(history_path: &std::path::Path) -> Option<String> {
     let history_path = shell_single_quote(&windows_path_to_msys(history_path)?);
     Some(format!(
         r#"#!/usr/bin/env bash
-printf '\n  --- Restored session history ---\n'
+printf '\n  --- Recent history (shared across Git Bash sessions) ---\n'
 tail -n 20 -- {history_path} | while IFS= read -r line; do
   printf '  %s\n' "$line"
 done
@@ -680,6 +958,32 @@ mod tests {
         shell_type, terminal_launch_cmd,
     };
     use crate::TerminalSession;
+
+    fn sess(shell: &str) -> TerminalSession {
+        TerminalSession {
+            shell: shell.to_string(),
+            cwd: r"C:\x".to_string(),
+            history: vec![],
+            window_title: String::new(),
+            inner_shell: String::new(),
+            exe: format!("{shell}.exe"),
+        }
+    }
+
+    #[test]
+    fn per_app_restore_maps_host_to_its_shells() {
+        let wt = r"C:\Program Files\WindowsApps\...\WindowsTerminal.exe";
+        // Selecting the Windows Terminal host restores its console shells...
+        assert!(session_matches_executable(&sess("powershell"), wt));
+        assert!(session_matches_executable(&sess("cmd"), wt));
+        assert!(session_matches_executable(&sess("pwsh"), wt));
+        // ...but not git-bash (that's mintty's).
+        assert!(!session_matches_executable(&sess("git_bash"), wt));
+        assert!(session_matches_executable(&sess("git_bash"), r"C:\Git\usr\bin\mintty.exe"));
+        // A directly-selected shell exe still matches its own shell only.
+        assert!(session_matches_executable(&sess("cmd"), r"C:\Windows\System32\cmd.exe"));
+        assert!(!session_matches_executable(&sess("powershell"), r"C:\Windows\System32\cmd.exe"));
+    }
 
     #[test]
     fn parses_git_bash_title_into_windows_cwd() {
@@ -721,6 +1025,8 @@ mod tests {
             cwd: String::new(),
             history: vec!["git status".to_string()],
             window_title: "MINGW64:/c/Users/Alice/project with spaces".to_string(),
+            inner_shell: String::new(),
+            exe: String::new(),
         };
         assert_eq!(shell_type(mintty.to_str().unwrap()), "git_bash");
         assert!(session_matches_executable(
@@ -739,7 +1045,7 @@ mod tests {
 
         let script = std::fs::read_to_string(root.join("restore_git_bash_1.sh")).unwrap();
         let history = std::fs::read_to_string(root.join("restore_git_bash_1.history")).unwrap();
-        assert!(script.contains("--- Restored session history ---"));
+        assert!(script.contains("--- Recent history (shared across Git Bash sessions) ---"));
         assert!(script.contains("exec /usr/bin/bash --login -i"));
         assert_eq!(history, "git status");
 
@@ -817,7 +1123,7 @@ fn build_ps_restore_script(session: &TerminalSession) -> String {
         lines.push(String::new());
         lines.push("Write-Host ''".to_string());
         lines.push(
-            "Write-Host '  --- Restored session history ---' -ForegroundColor DarkCyan"
+            "Write-Host '  --- Recent history (shared across PowerShell sessions) ---' -ForegroundColor DarkCyan"
                 .to_string(),
         );
 

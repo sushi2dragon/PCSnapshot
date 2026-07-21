@@ -10,13 +10,17 @@
 //! Nothing here ever fails the capture wholesale: every fallible step degrades to a warning
 //! so a snapshot is always produced (per the error-handling spec).
 
-use crate::{ContextClue, ProcessInfo, TerminalSession, WindowInfo, WindowPosition, WindowSize};
+use crate::{
+    ContextClue, ExplorerWindow, ProcessInfo, TerminalSession, WindowInfo, WindowPosition,
+    WindowSize,
+};
 use crate::classify::{self, Category};
 
 /// Structured result of inspecting the live desktop. The caller folds this into a `Snapshot`.
 pub struct CapturedDesktop {
     pub processes: Vec<ProcessInfo>,
     pub windows: Vec<WindowInfo>,
+    pub explorer_windows: Vec<ExplorerWindow>,
     pub context_clues: Vec<ContextClue>,
     pub restore_hints: Vec<String>,
     pub warnings: Vec<String>,
@@ -31,6 +35,7 @@ impl CapturedDesktop {
         CapturedDesktop {
             processes: vec![],
             windows: vec![],
+            explorer_windows: vec![],
             context_clues: vec![],
             restore_hints: vec![],
             warnings: vec![w],
@@ -64,6 +69,39 @@ pub fn capture_desktop(ignore_list: &[String]) -> CapturedDesktop {
     let foreground_pid = foreground_pid();
 
     let mut warnings: Vec<String> = vec![];
+
+    // Folder windows must be captured before the protected-shell PID filter
+    // below removes every explorer.exe-owned window.
+    let explorer_windows = match crate::explorer::query_live_windows() {
+        Ok(query) => {
+            warnings.extend(query.warnings);
+            query
+                .windows
+                .into_iter()
+                .filter(|folder| folder.restorable)
+                .filter_map(|folder| {
+                    let raw_window = raw.iter().find(|window| window.hwnd == folder.hwnd)?;
+                    let monitor_index = monitors
+                        .iter()
+                        .position(|monitor| *monitor == raw_window.monitor)
+                        .unwrap_or(0) as u32;
+                    Some(ExplorerWindow {
+                        path: folder.path,
+                        path_kind: folder.path_kind,
+                        title: raw_window.title.clone(),
+                        position: raw_window.pos.clone(),
+                        size: raw_window.size.clone(),
+                        state: raw_window.state.to_string(),
+                        monitor_index,
+                    })
+                })
+                .collect()
+        }
+        Err(error) => {
+            warnings.push(format!("File Explorer windows could not be captured: {error}"));
+            vec![]
+        }
+    };
 
     // Build the window list, foreground window first.
     let mut windows: Vec<(u32, WindowInfo)> = raw
@@ -178,6 +216,7 @@ pub fn capture_desktop(ignore_list: &[String]) -> CapturedDesktop {
     CapturedDesktop {
         processes,
         windows: enriched_windows,
+        explorer_windows,
         context_clues,
         restore_hints,
         warnings,

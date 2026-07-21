@@ -10,7 +10,9 @@ type Props = {
   snapshots: SnapshotSummary[]; events: ActivityEvent[]; selectedId: string | null; activeSessionId: string | null;
   onSelect: (id: string | null) => void; onCapture: () => void; onStartNew: () => void;
   onRestore: (id: string) => void; onDelete: (id: string) => void; onRecapture: (id: string) => void;
-  onRestoreApp: (id: string, exePath: string, appName: string) => void; restoringAppKey: string | null;
+  onRename: (id: string) => void;
+  onRestoreApp: (id: string, exePath: string, appName: string) => void;
+  onRestoreExplorer: (id: string) => void; restoringAppKey: string | null;
   onClearAll: () => void; onImport: () => void; onHelp: () => void; onRefresh: () => void;
   onIgnoreList: () => void; onToggleTerminalHook: () => void; terminalHookEnabled: boolean;
 };
@@ -58,8 +60,12 @@ export function MissionControl(p: Props) {
   const filtered = useMemo(() => p.snapshots.filter(s => s.name.toLowerCase().includes(search.toLowerCase())), [p.snapshots, search]);
   useEffect(() => {
     if (!p.selectedId) return;
-    getSnapshot(p.selectedId).then(setDetails).catch(() => setDetails(null));
-  }, [p.selectedId]);
+    let cancelled = false;
+    getSnapshot(p.selectedId)
+      .then(snapshot => { if (!cancelled) setDetails(snapshot); })
+      .catch(() => { if (!cancelled) setDetails(null); });
+    return () => { cancelled = true; };
+  }, [p.selectedId, selected?.timestamp]);
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.key.toLowerCase() === "s") { e.preventDefault(); p.onCapture(); }
@@ -97,8 +103,8 @@ export function MissionControl(p: Props) {
       {p.snapshots.length === 0 ? <div className="mission-empty"><div className="empty-mark">□</div><h1>Save your first workspace</h1><p>PC Snapshot remembers your open apps, windows, tabs and terminal — so you can bring the whole setup back in one click. Everything stays on this PC.</p><button className="primary" onClick={p.onCapture}>◉ Capture my desktop <kbd>Ctrl S</kbd></button><button className="link" onClick={p.onImport}>or import snapshots from a backup</button></div> : <>
         <div className="grid-header"><h1>All snapshots <small>{p.snapshots.length}</small></h1><div className="search">⌕ <input ref={searchRef} value={search} onChange={e => setSearch(e.target.value)} placeholder="Search or filter"/></div></div>
         <div className="snapshot-grid">{filtered.map(s => <article key={s.id} className={`snapshot-card ${p.selectedId === s.id ? "selected" : ""} ${s.warning_count ? "has-warning" : "ok"}`} onClick={() => p.onSelect(p.selectedId === s.id ? null : s.id)}>
-          <div className="thumb">{s.thumbnail_path && <img src={convertFileSrc(s.thumbnail_path)} alt=""/>}<div className="card-actions"><button onClick={e => {e.stopPropagation(); p.onRestore(s.id)}}>Restore</button><button onClick={e => {e.stopPropagation(); p.onRecapture(s.id)}}>↻</button><button onClick={e => {e.stopPropagation(); p.onDelete(s.id)}}>×</button></div></div>
-          <div className="card-copy"><strong>{s.name}</strong>{p.activeSessionId === s.id
+          <div className="thumb">{s.thumbnail_path && <img src={convertFileSrc(s.thumbnail_path)} alt=""/>}<div className="card-actions"><button onClick={e => {e.stopPropagation(); p.onRestore(s.id)}}>Restore</button><button aria-label={`Recapture ${s.name}`} title="Recapture" onClick={e => {e.stopPropagation(); p.onRecapture(s.id)}}>↻</button><button aria-label={`Delete ${s.name}`} title="Delete" onClick={e => {e.stopPropagation(); p.onDelete(s.id)}}>×</button></div></div>
+          <div className="card-copy"><div className="card-name"><strong>{s.name}</strong><button aria-label={`Rename ${s.name}`} title="Rename" onClick={e => {e.stopPropagation(); p.onRename(s.id)}}><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg></button></div>{p.activeSessionId === s.id
             ? <span className="working">● <i>Currently working</i></span>
             : s.warning_count
               ? <span className="warn">● <i>{s.warning_count} warnings</i></span>
@@ -112,7 +118,7 @@ export function MissionControl(p: Props) {
       <section className="panel-page details">
         <div className="detail-scroll">
           <button className="back" onClick={() => p.onSelect(null)}>← Activity</button>
-          <div className="detail-preview">{selected?.thumbnail_path && <img src={convertFileSrc(selected.thumbnail_path)} alt=""/>}<span>preview · {new Set(details?.windows.map(w => w.monitor_index)).size || 1} monitors</span></div>
+          <div className="detail-preview">{selected?.thumbnail_path && <img src={convertFileSrc(selected.thumbnail_path)} alt=""/>}<span>preview · {new Set([...(details?.windows ?? []), ...(details?.explorer_windows ?? [])].map(w => w.monitor_index)).size || 1} monitors</span></div>
           <h2>{selected?.name}</h2>
           <p className="muted">Captured {selected ? relative(selected.timestamp).toLowerCase() : ""}</p>
           <p className={selected?.warning_count ? "warning-text" : "success-text"}>● {selected?.warning_count ? `Captured with ${selected.warning_count} warning${selected.warning_count === 1 ? "" : "s"}` : "Captured successfully"}</p>
@@ -120,7 +126,23 @@ export function MissionControl(p: Props) {
             <div className="warning-heading">Warning details</div>
             {details.warnings.map((warning, index) => <div className="warning-message" key={`${index}-${warning}`}><span>!</span><p>{warning}</p></div>)}
           </div>}
-          <div className="contents-head"><span>CONTENTS</span><span>{details?.processes.length ?? "…"} apps</span></div>
+          <div className="contents-head"><span>CONTENTS</span><span>{details ? details.processes.length + (details.explorer_windows?.length ? 1 : 0) : "…"} apps</span></div>
+          {!!details?.explorer_windows?.length && (() => {
+            const restoreKey = `${details.id}:explorer`;
+            const restoring = p.restoringAppKey === restoreKey;
+            return <div className="app-row explorer-row">
+              <AppIcon proc={{ name: "File Explorer", pid: 0, exe_path: "C:\\Windows\\explorer.exe", cmd_line: "", classification: "background" }}/>
+              <b title={details.explorer_windows.map(window => window.path).join("\n")}>File Explorer</b>
+              <span className="app-row-trailing"><small className="app-count">{details.explorer_windows.length}</small><button
+                type="button"
+                className={`app-restore-button ${restoring ? "restoring" : ""}`}
+                disabled={restoring || p.restoringAppKey !== null}
+                aria-label="Restore File Explorer"
+                title="Restore captured File Explorer folders"
+                onClick={e => { e.stopPropagation(); if (p.selectedId) p.onRestoreExplorer(p.selectedId); }}
+              ><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v6h6"/></svg></button></span>
+            </div>;
+          })()}
           {details?.processes.map(proc => {
             const appName = proc.name.replace(/\.exe$/i, "");
             const restoreKey = `${details.id}:${proc.exe_path.toLowerCase()}`;

@@ -7,6 +7,57 @@
   --status-info:#6B8BFF; --status-destructive:#B4462F; --font-mono:"Cascadia Code","Cascadia Mono",Consolas,monospace;
 }
 
+.card-actions button {
+  cursor: pointer;
+}
+
+.card-actions button:not(:first-child):hover {
+  background: #343943;
+}
+
+.card-actions button:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 1px;
+}
+
+.card-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.card-name strong {
+  flex: 1;
+  min-width: 0;
+}
+
+.card-name button {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .15s ease, background .15s ease, color .15s ease;
+}
+
+.snapshot-card:hover .card-name button,
+.card-name button:focus-visible {
+  opacity: 1;
+}
+
+.card-name button:hover,
+.card-name button:focus-visible {
+  background: #343943;
+  color: #fff;
+  outline: none;
+}
+
 * {
   box-sizing: border-box;
 }

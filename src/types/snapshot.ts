@@ -16,6 +16,16 @@ export interface WindowInfo {
   exe_path?: string;
 }
 
+export interface ExplorerWindow {
+  path: string;
+  path_kind: "filesystem" | "virtual";
+  title: string;
+  position: { x: number; y: number };
+  size: { width: number; height: number };
+  state: "normal" | "minimized" | "maximized";
+  monitor_index: number;
+}
+
 export interface TerminalSession {
   shell: string;
   cwd: string;
@@ -68,11 +78,13 @@ export interface ContextClue {
 }
 
 export interface Snapshot {
+  schema_version?: number;
   id: string;
   name: string;
   timestamp: string;
   processes: ProcessInfo[];
   windows: WindowInfo[];
+  explorer_windows?: ExplorerWindow[];
   context_clues: ContextClue[];
   restore_hints: string[];
   warnings: string[];

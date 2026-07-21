@@ -27,6 +27,11 @@ export async function restoreApp(id: string, exePath: string): Promise<RestoreRe
   return invoke<RestoreResult>("restore_app", { id, exePath });
 }
 
+/** Restore every captured File Explorer folder window without touching other apps. */
+export async function restoreExplorerWindows(id: string): Promise<RestoreResult> {
+  return invoke<RestoreResult>("restore_explorer_windows", { id });
+}
+
 /** Whether the desktop the user is currently looking at is already captured somewhere. */
 export async function isCurrentStateSaved(): Promise<boolean> {
   return invoke<boolean>("is_current_state_saved");
@@ -34,6 +39,10 @@ export async function isCurrentStateSaved(): Promise<boolean> {
 
 export async function deleteSnapshot(id: string): Promise<void> {
   return invoke<void>("delete_snapshot", { id });
+}
+
+export async function renameSnapshot(id: string, name: string): Promise<SnapshotSummary> {
+  return invoke<SnapshotSummary>("rename_snapshot", { id, name });
 }
 
 export async function clearAllSnapshots(): Promise<void> {

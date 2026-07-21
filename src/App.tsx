@@ -15,7 +15,7 @@ import { terminalHookStatus, setTerminalHook } from "./commands/config";
 import type { RestoreResult } from "./types/snapshot";
 
 function App() {
-  const { snapshots, loading, capture, recapture, restore, restoreApp, remove, refresh } = useSnapshots();
+  const { snapshots, loading, capture, recapture, restore, restoreApp, restoreExplorer, remove, rename, refresh } = useSnapshots();
   const [modalOpen, setModalOpen] = useState(false);
   const [toast, setToast] = useState<{ message: string; type: "success" | "warning" } | null>(null);
   const [restoreReport, setRestoreReport] = useState<RestoreResult | null>(null);
@@ -28,6 +28,7 @@ function App() {
   const [showIgnoreList, setShowIgnoreList] = useState(false);
   const [confirmRecapture, setConfirmRecapture] = useState<{ id: string; name: string } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<{ id: string; name: string } | null>(null);
+  const [renameTarget, setRenameTarget] = useState<{ id: string; name: string } | null>(null);
   const [terminalHookEnabled, setTerminalHookEnabled] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [startNewOpen, setStartNewOpen] = useState(false);
@@ -165,6 +166,28 @@ function App() {
     [restoreApp, refreshActivity]
   );
 
+  const handleRestoreExplorer = useCallback(
+    async (id: string) => {
+      const key = `${id}:explorer`;
+      setRestoringAppKey(key);
+      try {
+        const result = await restoreExplorer(id);
+        await refreshActivity();
+        const hasDetail = result.failed_items.length > 0 || result.warnings.length > 0;
+        if (!result.success || hasDetail) {
+          setRestoreReport(result);
+        } else {
+          setToast({ message: result.message, type: "success" });
+        }
+      } catch (e) {
+        setToast({ message: `File Explorer restore failed: ${e}`, type: "warning" });
+      } finally {
+        setRestoringAppKey(null);
+      }
+    },
+    [restoreExplorer, refreshActivity]
+  );
+
   // "Save current first": stash the target, then open the capture name prompt.
   const handleSaveFirst = useCallback(() => {
     if (!confirmRestore) return;
@@ -223,6 +246,24 @@ function App() {
       setToast({ message: `Delete failed: ${e}`, type: "warning" });
     }
   }, [confirmDelete, remove, selectedId, refreshActivity]);
+
+  const handleRename = useCallback((id: string) => {
+    const snapshot = snapshots.find((item) => item.id === id);
+    if (snapshot) setRenameTarget({ id, name: snapshot.name });
+  }, [snapshots]);
+
+  const handleConfirmRename = useCallback(async (name: string) => {
+    if (!renameTarget) return;
+    const { id } = renameTarget;
+    setRenameTarget(null);
+    try {
+      await rename(id, name);
+      await refreshActivity();
+      setToast({ message: "Snapshot renamed", type: "success" });
+    } catch (e) {
+      setToast({ message: `Rename failed: ${e}`, type: "warning" });
+    }
+  }, [renameTarget, rename, refreshActivity]);
 
   const handleStartNew = useCallback(async (saveFirst: boolean) => {
     setStartNewOpen(false);
@@ -289,8 +330,8 @@ function App() {
       <MissionControl snapshots={snapshots} events={events} selectedId={selectedId} onSelect={setSelectedId}
         activeSessionId={activeId}
         onCapture={handleTakeSnapshot} onStartNew={() => setStartNewOpen(true)} onRestore={handleRestore}
-        onRestoreApp={handleRestoreApp} restoringAppKey={restoringAppKey}
-        onDelete={handleDelete} onRecapture={handleRecapture} onClearAll={handleClearAll} onImport={handleImport}
+        onRestoreApp={handleRestoreApp} onRestoreExplorer={handleRestoreExplorer} restoringAppKey={restoringAppKey}
+        onDelete={handleDelete} onRecapture={handleRecapture} onRename={handleRename} onClearAll={handleClearAll} onImport={handleImport}
         onHelp={handleHelp} onRefresh={handleRefresh} onIgnoreList={() => setShowIgnoreList(true)}
         onToggleTerminalHook={handleToggleTerminalHook} terminalHookEnabled={terminalHookEnabled}/>
       <StartNewModal open={startNewOpen} busy={startNewBusy} onCancel={() => setStartNewOpen(false)} onConfirm={handleStartNew}/>
@@ -304,6 +345,16 @@ function App() {
           setModalOpen(false);
           setSaveFirstPendingId(null);
         }}
+      />
+
+      <NamePromptModal
+        key={renameTarget?.id ?? "rename-closed"}
+        isOpen={renameTarget !== null}
+        defaultName={renameTarget?.name ?? ""}
+        title="Rename snapshot"
+        confirmLabel="Rename"
+        onConfirm={handleConfirmRename}
+        onCancel={() => setRenameTarget(null)}
       />
 
       <RestoreConfirmModal

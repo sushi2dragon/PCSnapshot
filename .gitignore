@@ -35,6 +35,11 @@ secrets*.json
 /snap_*.json
 /snap_*.png
 
+# AI collaboration / handoff files (local-only, never committed)
+/CHANGELOG.md
+/CLAUDE.md
+/AGENTS.md
+
 # Rust / Tauri build output
 src-tauri/target
 

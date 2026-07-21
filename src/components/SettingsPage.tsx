@@ -38,12 +38,13 @@ function SettingRow({ title, description, action }: { title: string; description
 export function SettingsPage(p: Props) {
   const [activeSection, setActiveSection] = useState<Section>("general");
   const contentRef = useRef<HTMLDivElement>(null);
-  const [query, setQuery] = useState("");
+  const [ignoreQuery, setIgnoreQuery] = useState("");
+  const [pickerQuery, setPickerQuery] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const { list, running, loading, add, remove, refresh } = useIgnoreList();
-  const filteredIgnored = useMemo(() => list.filter(x => x.toLowerCase().includes(query.toLowerCase())), [list, query]);
-  const available = useMemo(() => running.filter(x => !list.includes(x) && x.toLowerCase().includes(query.toLowerCase())), [running, list, query]);
+  const filteredIgnored = useMemo(() => list.filter(x => x.toLowerCase().includes(ignoreQuery.toLowerCase())), [list, ignoreQuery]);
+  const available = useMemo(() => running.filter(x => !list.includes(x) && x.toLowerCase().includes(pickerQuery.toLowerCase())), [running, list, pickerQuery]);
 
   const addApp = async (name: string) => {
     try { await add(name); setError(null); setPickerOpen(false); }
@@ -86,10 +87,10 @@ export function SettingsPage(p: Props) {
 
       <section className="settings-section" id="settings-ignore">
         <header className="settings-heading"><div><h1>Ignore List</h1><p>Apps here are never captured, restored, or closed — useful for background utilities and personal apps.</p></div></header>
-        <div className="settings-toolbar"><div className="settings-search">⌕<input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search applications…" /></div><button className="settings-primary" onClick={() => setPickerOpen(true)}>+ Add app</button></div>
+        <div className="settings-toolbar"><div className="settings-search">⌕<input value={ignoreQuery} onChange={e => setIgnoreQuery(e.target.value)} placeholder="Search applications…" /></div><button className="settings-primary" onClick={() => { setPickerQuery(""); setPickerOpen(true); }}>+ Add app</button></div>
         {error && <div className="settings-error">{error}</div>}
         <div className="ignore-list">
-          {loading ? <div className="settings-empty">Loading applications…</div> : filteredIgnored.length === 0 ? <div className="settings-empty">{query ? "No ignored apps match your search." : "No apps are ignored yet."}</div> : filteredIgnored.map(stem => <div className="ignore-row" key={stem}>
+          {loading ? <div className="settings-empty">Loading applications…</div> : filteredIgnored.length === 0 ? <div className="settings-empty">{ignoreQuery ? "No ignored apps match your search." : "No apps are ignored yet."}</div> : filteredIgnored.map(stem => <div className="ignore-row" key={stem}>
             <div className="app-glyph">{stem.slice(0, 2).toUpperCase()}</div><div className="ignore-copy"><strong>{stem}</strong><span>Added by you · excluded from capture and restore</span></div>
             <Toggle checked label={`Stop ignoring ${stem}`} onClick={() => remove(stem)} />
             <button className="remove-ignore" aria-label={`Remove ${stem}`} onClick={() => remove(stem)}>×</button>
@@ -97,7 +98,7 @@ export function SettingsPage(p: Props) {
         </div>
         {pickerOpen && createPortal(<div className="settings-picker" role="dialog" aria-modal="true" aria-label="Add an app to Ignore List" onMouseDown={e => e.target === e.currentTarget && setPickerOpen(false)}>
           <div className="settings-picker-card"><div className="settings-picker-head"><div><h2>Add an app</h2><p>Select a currently running application.</p></div><button aria-label="Close" onClick={() => setPickerOpen(false)}>×</button></div>
-            <div className="settings-search">⌕<input autoFocus value={query} onChange={e => setQuery(e.target.value)} placeholder="Search running apps…" /></div>
+            <div className="settings-search">⌕<input autoFocus value={pickerQuery} onChange={e => setPickerQuery(e.target.value)} placeholder="Search running apps…" /></div>
             <div className="running-list">{available.length === 0 ? <div className="settings-empty">No matching running applications.</div> : available.map(stem => <button key={stem} onClick={() => addApp(stem)}><span className="app-glyph">{stem.slice(0,2).toUpperCase()}</span><b>{stem}</b><span>＋</span></button>)}</div>
             <div className="settings-picker-foot"><button onClick={() => refresh()}>Refresh list</button><button onClick={() => setPickerOpen(false)}>Cancel</button></div>
           </div>

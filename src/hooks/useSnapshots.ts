@@ -60,6 +60,13 @@ export function useSnapshots() {
     []
   );
 
+  const restoreExplorer = useCallback(
+    async (id: string): Promise<RestoreResult> => {
+      return commands.restoreExplorerWindows(id);
+    },
+    []
+  );
+
   const recapture = useCallback(
     async (id: string): Promise<string[]> => {
       const result = await commands.recaptureSnapshot(id);
@@ -79,5 +86,13 @@ export function useSnapshots() {
     []
   );
 
-  return { snapshots, loading, capture, recapture, restore, restoreApp, remove, refresh };
+  const rename = useCallback(
+    async (id: string, name: string): Promise<void> => {
+      const updated = await commands.renameSnapshot(id, name);
+      setSnapshots((prev) => prev.map((s) => (s.id === id ? updated : s)));
+    },
+    []
+  );
+
+  return { snapshots, loading, capture, recapture, restore, restoreApp, restoreExplorer, remove, rename, refresh };
 }

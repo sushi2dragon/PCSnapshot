@@ -10,6 +10,7 @@ mod capture;
 mod classify;
 pub(crate) mod config;
 mod context;
+mod explorer;
 mod icons;
 mod restore;
 mod terminal;
@@ -41,7 +42,7 @@ pub(crate) fn tokenize(cmd: &str) -> Vec<String> {
 
 // ── Schema version ──────────────────────────────────────────────────────────
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const THUMBNAIL_WIDTH: u32 = 480;
 const THUMBNAIL_HEIGHT: u32 = 270;
 
@@ -81,12 +82,34 @@ pub struct WindowInfo {
     pub exe_path: String,
 }
 
+/// A concrete File Explorer folder window. Kept separate from `WindowInfo`
+/// because all folder windows share the protected Windows shell process.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ExplorerWindow {
+    pub path: String,
+    pub path_kind: String, // "filesystem" | "virtual"
+    pub title: String,
+    pub position: WindowPosition,
+    pub size: WindowSize,
+    pub state: String,
+    pub monitor_index: u32,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TerminalSession {
     pub shell: String,
     pub cwd: String,
     pub history: Vec<String>,
     pub window_title: String,
+    /// For Windows Terminal windows, the actual shell running inside
+    /// (cmd/powershell/pwsh) — the window's own exe is WindowsTerminal.exe, so this
+    /// is what restore relaunches directly. Empty for non-WT or unresolved shells.
+    #[serde(default)]
+    pub inner_shell: String,
+    /// The launchable executable for this shell (e.g. "cmd.exe", "powershell.exe",
+    /// or a full git-bash.exe path). Restore relaunches this directly.
+    #[serde(default)]
+    pub exe: String,
 }
 
 /// Browser identity as reported by the companion extension. The profile ID is
@@ -183,6 +206,8 @@ pub struct Snapshot {
     pub timestamp: String,
     pub processes: Vec<ProcessInfo>,
     pub windows: Vec<WindowInfo>,
+    #[serde(default)]
+    pub explorer_windows: Vec<ExplorerWindow>,
     pub context_clues: Vec<ContextClue>,
     pub restore_hints: Vec<String>,
     pub warnings: Vec<String>,
@@ -263,6 +288,15 @@ fn snapshot_to_summary(s: &Snapshot) -> SnapshotSummary {
         thumbnail_path: s.thumbnail_path.clone(),
         warning_count: s.warnings.len() as u32,
     }
+}
+
+fn with_snapshot_name(mut snapshot: Snapshot, name: &str) -> Result<Snapshot, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Snapshot name cannot be empty".to_string());
+    }
+    snapshot.name = trimmed.to_string();
+    Ok(snapshot)
 }
 
 /// Next free "Snapshot NN" auto-name number, derived from existing snapshot
@@ -445,6 +479,7 @@ async fn take_snapshot(
         timestamp,
         processes: captured.processes,
         windows: captured.windows,
+        explorer_windows: captured.explorer_windows,
         context_clues: captured.context_clues,
         restore_hints: captured.restore_hints,
         warnings: warnings.clone(),
@@ -531,6 +566,7 @@ async fn recapture_snapshot(
         timestamp,
         processes: captured.processes,
         windows: captured.windows,
+        explorer_windows: captured.explorer_windows,
         context_clues: captured.context_clues,
         restore_hints: captured.restore_hints,
         warnings: warnings.clone(),
@@ -682,6 +718,9 @@ fn snapshot_for_app(snapshot: &Snapshot, exe_path: &str) -> Result<(Snapshot, St
     app_snapshot
         .windows
         .retain(|window| window.exe_path.eq_ignore_ascii_case(exe_path));
+    // Explorer is not represented by a selectable ProcessInfo. Never let a
+    // selective app restore accidentally bring back unrelated folder windows.
+    app_snapshot.explorer_windows.clear();
     app_snapshot
         .terminal_sessions
         .retain(|session| terminal::session_matches_executable(session, exe_path));
@@ -712,6 +751,23 @@ fn snapshot_for_app(snapshot: &Snapshot, exe_path: &str) -> Result<(Snapshot, St
     app_snapshot.context_clues.clear();
 
     Ok((app_snapshot, app_name))
+}
+
+/// Build a selective-restore slice containing only captured File Explorer
+/// folder windows. Explorer never enters the ordinary process launch path.
+fn snapshot_for_explorer(snapshot: &Snapshot) -> Result<Snapshot, String> {
+    if snapshot.explorer_windows.is_empty() {
+        return Err("This snapshot has no File Explorer windows to restore".to_string());
+    }
+
+    let mut explorer_snapshot = snapshot.clone();
+    explorer_snapshot.processes.clear();
+    explorer_snapshot.windows.clear();
+    explorer_snapshot.context_clues.clear();
+    explorer_snapshot.restore_hints.clear();
+    explorer_snapshot.terminal_sessions.clear();
+    explorer_snapshot.browser_sessions.clear();
+    Ok(explorer_snapshot)
 }
 
 fn browser_family_matches_exe(family: &str, stem: &str) -> bool {
@@ -745,8 +801,10 @@ async fn restore_app(
     let has_browser_sessions = !sessions.is_empty();
     let ignore_list = config::load_config(&app).ignore_list;
 
-    // Selective restore is additive by contract: it never closes other apps or
-    // surplus windows belonging to the selected app.
+    // The desktop portion of a selective restore stays additive: it never
+    // closes unrelated apps or windows. Browser tabs are reconciled separately
+    // below because "restore this browser" means restoring its captured state,
+    // including removing tabs that are not in that state.
     let mut result = tauri::async_runtime::spawn_blocking(move || {
         restore::restore_desktop(&app_snapshot, false, &ignore_list, has_browser_sessions)
     })
@@ -757,8 +815,9 @@ async fn restore_app(
         let reply = browser_bridge
             .inner()
             .clone()
-            .restore(&sessions, false)
+            .restore(&sessions, true)
             .await;
+        result.closed_items.extend(reply.closed_items);
         result.warnings.extend(reply.warnings);
     }
     restore::focus_app(&exe_path);
@@ -794,6 +853,59 @@ async fn restore_app(
     );
     // A partial restore deliberately does not update active_session: the live
     // desktop is not equivalent to the complete snapshot.
+    Ok(result)
+}
+
+#[tauri::command]
+async fn restore_explorer_windows(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<RestoreResult, String> {
+    let dir = snapshots_dir(&app)?;
+    let path = json_path(&dir, &id);
+    let snapshot = try_load_snapshot(&path)
+        .ok_or_else(|| format!("Snapshot {id} is missing, corrupt, or unreadable"))?;
+    let snapshot_name = snapshot.name.clone();
+    let explorer_snapshot = snapshot_for_explorer(&snapshot)?;
+    let ignore_list = config::load_config(&app).ignore_list;
+
+    // Selective Explorer restore is additive: exact saved folders are reopened
+    // or repositioned, while unrelated currently-open folders remain untouched.
+    let mut result = tauri::async_runtime::spawn_blocking(move || {
+        restore::restore_desktop(&explorer_snapshot, false, &ignore_list, false)
+    })
+    .await
+    .map_err(|e| format!("File Explorer restore task failed: {e}"))?;
+
+    result.message = if !result.failed_items.is_empty() {
+        "File Explorer could not be fully restored".to_string()
+    } else if !result.warnings.is_empty() {
+        format!(
+            "File Explorer restored with {} warning(s)",
+            result.warnings.len()
+        )
+    } else {
+        "File Explorer restored".to_string()
+    };
+
+    let mut details = result.failed_items.clone();
+    details.extend(result.warnings.clone());
+    activity::append(
+        &app,
+        activity::event(
+            "restore_app",
+            Some(snapshot_name),
+            if !result.failed_items.is_empty() {
+                "failed"
+            } else if !result.warnings.is_empty() {
+                "warning"
+            } else {
+                "success"
+            },
+            result.message.clone(),
+            details,
+        ),
+    );
     Ok(result)
 }
 
@@ -841,6 +953,39 @@ async fn is_current_state_saved(app: tauri::AppHandle) -> Result<bool, String> {
     })
     .await
     .map_err(|e| format!("State check failed: {e}"))?
+}
+
+#[tauri::command]
+async fn rename_snapshot(
+    app: tauri::AppHandle,
+    id: String,
+    name: String,
+) -> Result<SnapshotSummary, String> {
+    let dir = snapshots_dir(&app)?;
+    let path = json_path(&dir, &id);
+    let snapshot = try_load_snapshot(&path)
+        .ok_or_else(|| format!("Snapshot {id} not found or unreadable"))?;
+    if snapshot.id != id {
+        return Err("Snapshot id does not match its stored file".to_string());
+    }
+
+    let old_name = snapshot.name.clone();
+    let renamed = with_snapshot_name(snapshot, &name)?;
+    let json = serde_json::to_string_pretty(&renamed)
+        .map_err(|e| format!("Serialise error: {e}"))?;
+    std::fs::write(&path, json).map_err(|e| format!("Write error: {e}"))?;
+
+    activity::append(
+        &app,
+        activity::event(
+            "rename",
+            Some(renamed.name.clone()),
+            "success",
+            "Snapshot renamed".to_string(),
+            vec![format!("{old_name} → {}", renamed.name)],
+        ),
+    );
+    Ok(snapshot_to_summary(&renamed))
 }
 
 #[tauri::command]
@@ -993,6 +1138,8 @@ pub fn run() {
             activity::list_activity,
             restore_snapshot,
             restore_app,
+            restore_explorer_windows,
+            rename_snapshot,
             delete_snapshot,
             clear_all_snapshots,
             is_current_state_saved,
@@ -1011,7 +1158,49 @@ pub fn run() {
 
 #[cfg(test)]
 mod snapshot_schema_tests {
-    use super::{snapshot_for_app, Snapshot};
+    use super::{snapshot_for_app, snapshot_for_explorer, with_snapshot_name, Snapshot};
+
+    #[test]
+    fn rename_changes_only_the_trimmed_display_name() {
+        let snapshot: Snapshot = serde_json::from_str(
+            r#"{
+            "schema_version": 2,
+            "id": "snap_rename",
+            "name": "Old name",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "processes": [],
+            "windows": [],
+            "context_clues": [],
+            "restore_hints": [],
+            "warnings": ["kept"],
+            "thumbnail_path": "C:/snapshot.png"
+        }"#,
+        )
+        .unwrap();
+
+        let renamed = with_snapshot_name(snapshot, "  New name  ").unwrap();
+        assert_eq!(renamed.name, "New name");
+        assert_eq!(renamed.id, "snap_rename");
+        assert_eq!(renamed.timestamp, "2026-01-01T00:00:00Z");
+        assert_eq!(renamed.warnings, vec!["kept"]);
+    }
+
+    #[test]
+    fn rename_rejects_a_blank_name() {
+        let snapshot: Snapshot = serde_json::from_str(
+            r#"{
+            "schema_version": 2,
+            "id": "snap_rename",
+            "name": "Old name",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "processes": [], "windows": [], "context_clues": [],
+            "restore_hints": [], "warnings": [], "thumbnail_path": ""
+        }"#,
+        )
+        .unwrap();
+
+        assert!(with_snapshot_name(snapshot, "  ").is_err());
+    }
 
     #[test]
     fn v2_snapshot_without_browser_sessions_remains_readable() {
@@ -1032,6 +1221,92 @@ mod snapshot_schema_tests {
         .expect("v2 snapshots must remain readable");
 
         assert!(snapshot.browser_sessions.is_empty());
+        assert!(snapshot.explorer_windows.is_empty());
+    }
+
+    #[test]
+    fn explorer_folder_windows_round_trip_with_geometry() {
+        let snapshot: Snapshot = serde_json::from_str(
+            r#"{
+            "schema_version": 4,
+            "id": "snap_explorer",
+            "name": "Folders",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "processes": [],
+            "windows": [],
+            "explorer_windows": [{
+                "path": "C:\\Users\\sarth\\Downloads",
+                "path_kind": "filesystem",
+                "title": "Downloads",
+                "position": {"x": 100, "y": 200},
+                "size": {"width": 900, "height": 700},
+                "state": "maximized",
+                "monitor_index": 1
+            }],
+            "context_clues": [],
+            "restore_hints": [],
+            "warnings": [],
+            "thumbnail_path": "C:/snapshot.png"
+        }"#,
+        )
+        .expect("schema v4 Explorer window must deserialize");
+
+        let folder = &snapshot.explorer_windows[0];
+        assert_eq!(folder.path, r"C:\Users\sarth\Downloads");
+        assert_eq!(folder.position.x, 100);
+        assert_eq!(folder.size.height, 700);
+        assert_eq!(folder.state, "maximized");
+        assert_eq!(folder.monitor_index, 1);
+
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        let decoded: Snapshot = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.explorer_windows[0].path, folder.path);
+    }
+
+    #[test]
+    fn selective_explorer_restore_slice_contains_only_folder_windows() {
+        let snapshot: Snapshot = serde_json::from_str(
+            r#"{
+            "schema_version":4,"id":"snap_explorer","name":"Mixed","timestamp":"2026-01-01T00:00:00Z",
+            "processes":[{"name":"notepad.exe","pid":1,"exe_path":"C:\\Windows\\notepad.exe","cmd_line":"notepad.exe","classification":"foreground"}],
+            "windows":[{"title":"Notes","position":{"x":1,"y":2},"size":{"width":800,"height":600},"state":"normal","monitor_index":0,"exe_path":"C:\\Windows\\notepad.exe"}],
+            "explorer_windows":[
+                {"path":"C:\\Downloads","path_kind":"filesystem","title":"Downloads","position":{"x":3,"y":4},"size":{"width":900,"height":700},"state":"normal","monitor_index":0},
+                {"path":"C:\\Scripts","path_kind":"filesystem","title":"Scripts","position":{"x":13,"y":14},"size":{"width":800,"height":600},"state":"normal","monitor_index":0},
+                {"path":"C:\\Model Output","path_kind":"filesystem","title":"Model Output","position":{"x":23,"y":24},"size":{"width":700,"height":500},"state":"maximized","monitor_index":1}
+            ],
+            "context_clues":[{"type":"file","value":"notes.txt","confidence":1.0,"source":"test"}],
+            "restore_hints":["foreground:notepad.exe"],"warnings":[],"thumbnail_path":"C:/snapshot.png",
+            "terminal_sessions":[{"shell":"powershell","cwd":"C:\\repo","history":[],"window_title":"PowerShell"}],
+            "browser_sessions":[]
+        }"#,
+        )
+        .unwrap();
+
+        let explorer = snapshot_for_explorer(&snapshot).unwrap();
+        assert_eq!(explorer.explorer_windows.len(), 3);
+        assert_eq!(explorer.explorer_windows[1].path, r"C:\Scripts");
+        assert_eq!(explorer.explorer_windows[2].title, "Model Output");
+        assert!(explorer.processes.is_empty());
+        assert!(explorer.windows.is_empty());
+        assert!(explorer.context_clues.is_empty());
+        assert!(explorer.restore_hints.is_empty());
+        assert!(explorer.terminal_sessions.is_empty());
+        assert!(explorer.browser_sessions.is_empty());
+        assert_eq!(snapshot.processes.len(), 1, "persisted snapshot is not mutated");
+    }
+
+    #[test]
+    fn selective_explorer_restore_rejects_snapshots_without_folders() {
+        let snapshot: Snapshot = serde_json::from_str(
+            r#"{
+            "schema_version":3,"id":"old","name":"Old","timestamp":"2026-01-01T00:00:00Z",
+            "processes":[],"windows":[],"context_clues":[],"restore_hints":[],"warnings":[],
+            "thumbnail_path":"C:/snapshot.png"
+        }"#,
+        )
+        .unwrap();
+        assert!(snapshot_for_explorer(&snapshot).is_err());
     }
 
     #[test]
@@ -1072,6 +1347,7 @@ mod snapshot_schema_tests {
                 {"title":"Opera","position":{"x":1,"y":2},"size":{"width":800,"height":600},"state":"normal","monitor_index":0,"exe_path":"C:\\Apps\\opera.exe"},
                 {"title":"Repo - Code","position":{"x":3,"y":4},"size":{"width":900,"height":700},"state":"normal","monitor_index":0,"exe_path":"C:\\Apps\\Code.exe"}
             ],
+            "explorer_windows": [{"path":"C:\\Downloads","path_kind":"filesystem","title":"Downloads","position":{"x":5,"y":6},"size":{"width":700,"height":500},"state":"normal","monitor_index":0}],
             "context_clues": [{"type":"browser_tab","value":"https://example.com","confidence":0.9,"source":"test"}],
             "restore_hints": [
                 "browser_tab:opera:https://example.com",
@@ -1102,6 +1378,7 @@ mod snapshot_schema_tests {
         );
         assert!(app.context_clues.is_empty());
         assert!(app.terminal_sessions.is_empty());
+        assert!(app.explorer_windows.is_empty());
         assert_eq!(app.browser_sessions.len(), 1);
         assert_eq!(app.browser_sessions[0].browser.family, "opera");
         assert_eq!(
