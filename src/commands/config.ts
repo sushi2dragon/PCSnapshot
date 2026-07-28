@@ -25,3 +25,12 @@ export async function terminalHookStatus(): Promise<boolean> {
 export async function setTerminalHook(enabled: boolean): Promise<string> {
   return invoke<string>("set_terminal_hook", { enabled });
 }
+
+/** Master opt-in for clipboard capture & restore. */
+export async function getCaptureClipboard(): Promise<boolean> {
+  return invoke<boolean>("get_capture_clipboard");
+}
+
+export async function setCaptureClipboard(enabled: boolean): Promise<void> {
+  return invoke<void>("set_capture_clipboard", { enabled });
+}

@@ -1,9 +1,12 @@
 import { useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { useIgnoreList } from "../hooks/useIgnoreList";
-import type { SnapshotSummary } from "../types/snapshot";
+import { useClipboard } from "../hooks/useClipboard";
+import { KebabMenu } from "./KebabMenu";
+import type { ClipboardCacheRow, SnapshotSummary } from "../types/snapshot";
 
-type Section = "general" | "ignore" | "capture" | "terminal" | "storage" | "transfer" | "account" | "about";
+type Section = "general" | "ignore" | "capture" | "terminal" | "clipboard" | "storage" | "transfer" | "account" | "about";
 
 type Props = {
   snapshots: SnapshotSummary[];
@@ -21,6 +24,7 @@ const sections: { key: Section; label: string }[] = [
   { key: "ignore", label: "Ignore List" },
   { key: "capture", label: "Capture" },
   { key: "terminal", label: "Terminal & Browser" },
+  { key: "clipboard", label: "Clipboard Cache" },
   { key: "storage", label: "Storage" },
   { key: "transfer", label: "Import & Export" },
   { key: "account", label: "Plans & Account" },
@@ -43,6 +47,19 @@ export function SettingsPage(p: Props) {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const { list, running, loading, add, remove, refresh } = useIgnoreList();
+  const clip = useClipboard();
+  // Copy feedback: the click is otherwise silent, and a silent button reads as
+  // a broken one. Re-arms on every press so repeat copies each show a tick.
+  const [copied, setCopied] = useState<{ id: string; ok: boolean } | null>(null);
+  const copyTimer = useRef<number | null>(null);
+  const copyRow = (row: ClipboardCacheRow) => {
+    const settle = (ok: boolean) => {
+      if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+      setCopied({ id: row.row_id, ok });
+      copyTimer.current = window.setTimeout(() => { copyTimer.current = null; setCopied(null); }, ok ? 1400 : 2600);
+    };
+    clip.copy(row).then(() => settle(true)).catch(() => settle(false));
+  };
   const filteredIgnored = useMemo(() => list.filter(x => x.toLowerCase().includes(ignoreQuery.toLowerCase())), [list, ignoreQuery]);
   const available = useMemo(() => running.filter(x => !list.includes(x) && x.toLowerCase().includes(pickerQuery.toLowerCase())), [running, list, pickerQuery]);
 
@@ -113,6 +130,37 @@ export function SettingsPage(p: Props) {
       <section className="settings-section" id="settings-terminal">
         <header className="settings-heading"><div><h1>Terminal & Browser</h1><p>Control optional context collection for richer restores.</p></div></header>
         <div className="settings-card"><SettingRow title="PowerShell directory capture" description="Adds a small PowerShell profile hook so terminal working directories can be restored." action={<Toggle checked={p.terminalHookEnabled} label="PowerShell directory capture" onClick={p.onToggleTerminalHook}/>}/><SettingRow title="Browser companion" description="Browser tabs are captured when the local companion is connected; failures remain non-fatal."/></div>
+      </section>
+
+      <section className="settings-section" id="settings-clipboard">
+        <header className="settings-heading"><div><h1>Clipboard Cache</h1><p>Optionally capture the clipboard and Win+V history with each snapshot, then reseed it on restore. Off means nothing is ever read or written — pinned Win+V items are always left untouched.</p></div></header>
+        <div className="settings-card"><SettingRow title="Capture clipboard" description="Store the current clipboard and Win+V history (text and images) inside snapshots, and reseed Win+V when you restore. Passwords marked sensitive by their app are never captured." action={<Toggle checked={clip.enabled} label="Capture clipboard" onClick={() => { void clip.toggle(); }}/>}/></div>
+        {/* Bounded, self-scrolling panel: the cache grows with every snapshot and
+            backup, so an unbounded list would push the rest of Settings off-screen. */}
+        <div className={`clip-cache-panel ${clip.enabled ? "" : "clip-cache-disabled"}`}>
+        <div className="clip-cache-head"><span>Saved items</span>{clip.enabled && !clip.loading && <span>{clip.rows.length} item{clip.rows.length === 1 ? "" : "s"}</span>}</div>
+        <div className="clip-cache">
+          {!clip.enabled ? <div className="settings-empty">Turn on clipboard capture to browse and re-copy saved clipboard items.</div>
+            : clip.loading ? <div className="settings-empty">Loading clipboard items…</div>
+            : clip.rows.length === 0 ? <div className="settings-empty">No clipboard items captured yet.</div>
+            : clip.rows.map(row => <div className="clip-cache-row" key={row.row_id}>
+                {row.kind === "image" && row.sidecar_path
+                  ? <img className="clip-thumb" src={convertFileSrc(row.sidecar_path)} alt=""/>
+                  : <span className="clip-glyph">T</span>}
+                <div className="clip-cache-copy"><strong>{row.kind === "image" ? "Image" : ((row.text ?? "").trim().slice(0, 120) || "(empty)")}</strong><span>{row.label}</span></div>
+                {(() => {
+                  const state = copied?.id === row.row_id ? (copied.ok ? "copied" : "copy-failed") : "";
+                  return <button className={`settings-secondary clip-cache-btn ${state}`} onClick={() => copyRow(row)}
+                    title={state === "copy-failed" ? "Copy failed — Windows did not accept the clipboard write" : "Copy to clipboard"}>
+                    {state === "copied"
+                      ? <><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>Copied</>
+                      : state === "copy-failed" ? "Failed" : "Copy"}
+                  </button>;
+                })()}
+                <KebabMenu items={[{ label: "Copy", onClick: () => copyRow(row) }, { label: "Delete", danger: true, onClick: () => { void clip.remove(row); } }]}/>
+              </div>)}
+        </div>
+        </div>
       </section>
 
       <section className="settings-section" id="settings-storage">

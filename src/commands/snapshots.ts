@@ -41,6 +41,11 @@ export async function deleteSnapshot(id: string): Promise<void> {
   return invoke<void>("delete_snapshot", { id });
 }
 
+/** Copy a snapshot to a new one named "<name> (copy)"; returns the new summary. */
+export async function duplicateSnapshot(id: string): Promise<SnapshotSummary> {
+  return invoke<SnapshotSummary>("duplicate_snapshot", { id });
+}
+
 export async function renameSnapshot(id: string, name: string): Promise<SnapshotSummary> {
   return invoke<SnapshotSummary>("rename_snapshot", { id, name });
 }

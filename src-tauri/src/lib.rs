@@ -8,6 +8,7 @@ mod active_session;
 pub mod browser_bridge;
 mod capture;
 mod classify;
+mod clipboard;
 pub(crate) mod config;
 mod context;
 mod explorer;
@@ -42,7 +43,7 @@ pub(crate) fn tokenize(cmd: &str) -> Vec<String> {
 
 // ── Schema version ──────────────────────────────────────────────────────────
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const THUMBNAIL_WIDTH: u32 = 480;
 const THUMBNAIL_HEIGHT: u32 = 270;
 
@@ -216,6 +217,11 @@ pub struct Snapshot {
     pub terminal_sessions: Vec<TerminalSession>,
     #[serde(default, deserialize_with = "deserialize_browser_sessions")]
     pub browser_sessions: Vec<BrowserSession>,
+    /// Captured clipboard (current + Win+V history). Present only when the
+    /// clipboard opt-in was on at capture time. Optional/tolerant so older
+    /// snapshots load unchanged.
+    #[serde(default)]
+    pub clipboard: Option<clipboard::ClipboardBlock>,
 }
 
 /// Lightweight summary returned by list_snapshots — avoids loading full data.
@@ -226,6 +232,13 @@ pub struct SnapshotSummary {
     pub timestamp: String,
     pub thumbnail_path: String,
     pub warning_count: u32,
+    /// Captured apps (processes, plus one for File Explorer if any folders were captured).
+    pub app_count: u32,
+    /// Distinct monitors spanned by the captured windows (at least 1).
+    pub monitor_count: u32,
+    /// Exe paths of the first few distinct apps (capture order, foreground first),
+    /// for the tile's app-icon stack. Empty/dup-stem paths are skipped.
+    pub top_apps: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -281,12 +294,43 @@ fn try_load_snapshot(path: &PathBuf) -> Option<Snapshot> {
 }
 
 fn snapshot_to_summary(s: &Snapshot) -> SnapshotSummary {
+    let mut monitors: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for w in &s.windows {
+        monitors.insert(w.monitor_index);
+    }
+    for w in &s.explorer_windows {
+        monitors.insert(w.monitor_index);
+    }
+    let app_count = s.processes.len() as u32 + if s.explorer_windows.is_empty() { 0 } else { 1 };
+    // First few distinct apps (by exe stem), in capture order, for the tile icon stack.
+    let mut seen = std::collections::HashSet::new();
+    let mut top_apps = Vec::new();
+    for p in &s.processes {
+        if p.exe_path.is_empty() {
+            continue;
+        }
+        let stem = std::path::Path::new(&p.exe_path)
+            .file_stem()
+            .and_then(|x| x.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if stem.is_empty() || !seen.insert(stem) {
+            continue;
+        }
+        top_apps.push(p.exe_path.clone());
+        if top_apps.len() >= 5 {
+            break;
+        }
+    }
     SnapshotSummary {
         id: s.id.clone(),
         name: s.name.clone(),
         timestamp: s.timestamp.clone(),
         thumbnail_path: s.thumbnail_path.clone(),
         warning_count: s.warnings.len() as u32,
+        app_count,
+        monitor_count: (monitors.len() as u32).max(1),
+        top_apps,
     }
 }
 
@@ -451,8 +495,23 @@ async fn take_snapshot(
         bridge.capture(std::time::Duration::from_millis(1200)).await
     });
 
-    // Real capture engine: enumerate windows + processes on this thread.
     let cfg = config::load_config(&app);
+
+    // Clipboard capture (opt-in) starts here so it overlaps enumeration instead
+    // of adding to it — same reasoning as the screenshot thread above, and what
+    // keeps the whole capture inside its time budget. It is internally
+    // time-boxed, so a wedged clipboard service costs a warning, not the
+    // snapshot. Sidecars for image items land next to the thumbnail.
+    let clip_task = if cfg.capture_clipboard {
+        let (clip_dir, clip_id) = (dir.clone(), id.clone());
+        Some(tauri::async_runtime::spawn_blocking(move || {
+            clipboard::capture(&clip_dir, &clip_id)
+        }))
+    } else {
+        None
+    };
+
+    // Real capture engine: enumerate windows + processes on this thread.
     let captured = capture::capture_desktop(&cfg.ignore_list);
     let mut warnings: Vec<String> = captured.warnings;
 
@@ -472,6 +531,17 @@ async fn take_snapshot(
         Err(_) => warnings.push("Thumbnail capture thread panicked".to_string()),
     }
 
+    let clipboard_block = match clip_task {
+        Some(task) => {
+            let (block, clip_warnings) = task
+                .await
+                .unwrap_or_else(|e| (None, vec![format!("Clipboard capture task failed: {e}")]));
+            warnings.extend(clip_warnings);
+            block
+        }
+        None => None,
+    };
+
     let snapshot = Snapshot {
         schema_version: SCHEMA_VERSION,
         id: id.clone(),
@@ -486,6 +556,7 @@ async fn take_snapshot(
         thumbnail_path: thumbnail_path_buf.to_string_lossy().into_owned(),
         terminal_sessions: captured.terminal_sessions,
         browser_sessions: browser_reply.sessions,
+        clipboard: clipboard_block,
     };
 
     let json =
@@ -559,6 +630,15 @@ async fn recapture_snapshot(
         }
     };
 
+    // Clipboard capture (opt-in) — overwrites the prior block for this id.
+    let clipboard_block = if cfg.capture_clipboard {
+        let (block, clip_warnings) = capture_clipboard_block(&dir, &id).await;
+        warnings.extend(clip_warnings);
+        block
+    } else {
+        None
+    };
+
     let snapshot = Snapshot {
         schema_version: SCHEMA_VERSION,
         id: id.clone(),
@@ -573,6 +653,7 @@ async fn recapture_snapshot(
         thumbnail_path: thumbnail_path_buf.to_string_lossy().into_owned(),
         terminal_sessions: captured.terminal_sessions,
         browser_sessions: browser_reply.sessions,
+        clipboard: clipboard_block,
     };
 
     // Write to temp file first, then rename — if capture fails the original is untouched.
@@ -661,9 +742,11 @@ async fn restore_snapshot(
 
     let close_others = close_others.unwrap_or(false);
     let cfg = config::load_config(&app);
+    let capture_clipboard = cfg.capture_clipboard;
     let ignore_list = cfg.ignore_list;
     let sessions = snapshot.browser_sessions.clone();
     let snapshot_name = snapshot.name.clone();
+    let clipboard_block = snapshot.clipboard.clone();
     let has_browser_sessions = !sessions.is_empty();
 
     let mut result = tauri::async_runtime::spawn_blocking(move || {
@@ -680,6 +763,33 @@ async fn restore_snapshot(
             .await;
         result.closed_items.extend(reply.closed_items);
         result.warnings.extend(reply.warnings);
+    }
+
+    // Clipboard reseed — only when opted in and this snapshot carries a clipboard
+    // block (so restoring an older, clipboard-less snapshot never clears the live
+    // Win+V). Safety invariant: back up + verify the current clipboard first, and
+    // ClearHistory only runs when that backup is confirmed.
+    if capture_clipboard {
+        if let Some(block) = clipboard_block {
+            if !block.is_empty() {
+                let backup_ok = match backup_current_clipboard_async(&app, &snapshot_name).await {
+                    Ok(ok) => ok,
+                    Err(e) => {
+                        result
+                            .warnings
+                            .push(format!("Clipboard pre-restore backup failed: {e}"));
+                        false
+                    }
+                };
+                let clip_dir = dir.clone();
+                let reseed_warnings = tauri::async_runtime::spawn_blocking(move || {
+                    clipboard::reseed_history(&clip_dir, &block, backup_ok)
+                })
+                .await
+                .unwrap_or_else(|e| vec![format!("Clipboard reseed task failed: {e}")]);
+                result.warnings.extend(reseed_warnings);
+            }
+        }
     }
 
     let mut details = result.failed_items.clone();
@@ -909,47 +1019,84 @@ async fn restore_explorer_windows(
     Ok(result)
 }
 
-/// Heuristic: is the desktop the user is looking at right now already captured in some
-/// saved snapshot? Compares the set of currently-open apps against each snapshot's app
-/// set (Jaccard similarity). Used to warn before a clean restore would discard unsaved
-/// state. Conservative: returns `false` (treat as unsaved) when uncertain.
+/// How far the live desktop is from `snap_windows`, as a symmetric per-app window-count
+/// difference: `sum over apps of |live_windows − snapshot_windows|`. Zero means the
+/// snapshot holds exactly the apps/windows open now — no more, no fewer. Symmetric on
+/// purpose: opening an app *and* closing one both count as drift, because the question
+/// is "does my current desktop match a saved snapshot," not "would a restore lose
+/// something." Pure core of `is_current_state_saved`.
+fn window_multiset_diff(
+    live: &std::collections::HashMap<String, usize>,
+    snap_windows: &[WindowInfo],
+) -> usize {
+    let mut snap_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for w in snap_windows {
+        if w.exe_path.is_empty() {
+            continue;
+        }
+        *snap_counts
+            .entry(restore::exe_stem_pub(&w.exe_path))
+            .or_insert(0) += 1;
+    }
+    // Live surplus (apps/windows open that the snapshot lacks) …
+    let live_surplus: usize = live
+        .iter()
+        .map(|(stem, &n)| n.saturating_sub(snap_counts.get(stem).copied().unwrap_or(0)))
+        .sum();
+    // … plus snapshot surplus (apps/windows the snapshot has that are now closed).
+    let snap_surplus: usize = snap_counts
+        .iter()
+        .map(|(stem, &n)| n.saturating_sub(live.get(stem).copied().unwrap_or(0)))
+        .sum();
+    live_surplus + snap_surplus
+}
+
+/// Is the desktop the user is looking at right now already captured in some saved
+/// snapshot? Drives the restore-confirm warning. The question is symmetric: does any
+/// snapshot hold *exactly* the apps/windows open now — no extras, none missing? We take
+/// a live per-app window multiset and, for each snapshot, compute the symmetric count
+/// difference (`window_multiset_diff`). "Saved" iff some snapshot matches exactly
+/// (diff == 0).
+///
+/// This trips when you open another app, open a second window of an app already open,
+/// *or close an app that was in the snapshot*. Titles and geometry are excluded, so it
+/// never flips from ordinary title churn or a nudged window — but that also means the
+/// known blind spot is browser tabs: adding or switching a tab changes no window count,
+/// so an instant check can't see it (that needs the slow capture path). Conservative:
+/// an enumeration failure reads as "not matched" (warns).
 #[tauri::command]
 async fn is_current_state_saved(app: tauri::AppHandle) -> Result<bool, String> {
     let dir = snapshots_dir(&app)?;
+    let ignore_list = config::load_config(&app).ignore_list;
 
     // Win32 window enumeration + per-snapshot disk reads are synchronous;
     // offload so we never block the async runtime (same pattern as restore).
     tauri::async_runtime::spawn_blocking(move || {
-        let current = restore::current_app_set();
-        if current.is_empty() {
-            // Nothing meaningful open — nothing to lose, treat as "saved".
+        // Same enumeration + ignore filter capture uses, so live windows are directly
+        // comparable to each snapshot's stored `windows`.
+        let live = capture::current_window_counts(&ignore_list);
+        if live.is_empty() {
+            // Nothing meaningful open — nothing a restore could lose, treat as "saved".
             return Ok(true);
         }
 
         let entries = std::fs::read_dir(&dir).map_err(|e| format!("Read dir error: {e}"))?;
-        let mut best = 0.0_f32;
+        let mut best_diff = usize::MAX;
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
             if let Some(snap) = try_load_snapshot(&path) {
-                let snap_set: std::collections::HashSet<String> = snap
-                    .processes
-                    .iter()
-                    .filter(|p| !p.exe_path.is_empty())
-                    .map(|p| restore::exe_stem_pub(&p.exe_path))
-                    .collect();
-                let inter = current.intersection(&snap_set).count() as f32;
-                let union = current.union(&snap_set).count() as f32;
-                if union > 0.0 {
-                    best = best.max(inter / union);
+                best_diff = best_diff.min(window_multiset_diff(&live, &snap.windows));
+                if best_diff == 0 {
+                    break; // exact match — no snapshot can do better
                 }
             }
         }
 
-        // ≥ 0.8 overlap → the current arrangement is essentially already captured.
-        Ok(best >= 0.8)
+        // Saved only when some snapshot's apps/windows match the live desktop exactly.
+        Ok(best_diff == 0)
     })
     .await
     .map_err(|e| format!("State check failed: {e}"))?
@@ -1008,6 +1155,36 @@ async fn delete_snapshot(app: tauri::AppHandle, id: String) -> Result<(), String
         active_session::clear(&app);
     }
     Ok(())
+}
+
+#[tauri::command]
+async fn duplicate_snapshot(app: tauri::AppHandle, id: String) -> Result<SnapshotSummary, String> {
+    let dir = snapshots_dir(&app)?;
+    let mut snapshot = try_load_snapshot(&json_path(&dir, &id))
+        .ok_or_else(|| format!("Snapshot {id} not found or unreadable"))?;
+
+    let new_id = format!("snap_{}", chrono::Utc::now().timestamp_millis());
+    let new_png = png_path(&dir, &new_id);
+
+    // Copy the thumbnail so the duplicate has its own image; a missing source PNG
+    // (older/partial snapshot) is not fatal — the tile falls back to the placeholder.
+    let src_png = png_path(&dir, &id);
+    if src_png.exists() {
+        std::fs::copy(&src_png, &new_png).map_err(|e| format!("Copy thumbnail error: {e}"))?;
+    }
+
+    snapshot.id = new_id.clone();
+    snapshot.timestamp = chrono::Utc::now().to_rfc3339();
+    snapshot.name = format!("{} (copy)", snapshot.name);
+    snapshot.thumbnail_path = new_png.to_string_lossy().to_string();
+
+    let json = serde_json::to_string_pretty(&snapshot).map_err(|e| format!("Serialise error: {e}"))?;
+    std::fs::write(json_path(&dir, &new_id), json).map_err(|e| format!("Write error: {e}"))?;
+
+    activity::append(&app, activity::event(
+        "duplicate", Some(snapshot.name.clone()), "success", "Snapshot duplicated".into(), vec![],
+    ));
+    Ok(snapshot_to_summary(&snapshot))
 }
 
 #[tauri::command]
@@ -1122,6 +1299,382 @@ fn get_app_icon(exe_path: String) -> Option<String> {
     icons::extract_icon_data_uri(&exe_path)
 }
 
+// ── Clipboard opt-in + cache ─────────────────────────────────────────────────
+
+/// Auto-backups kept (rolling) — pre-restore snapshots of the live clipboard.
+const MAX_AUTO_BACKUPS: usize = 5;
+
+#[derive(Serialize, Deserialize, Clone)]
+struct ClipboardCacheEntry {
+    id: String,
+    label: String,
+    created_at: String,
+    block: clipboard::ClipboardBlock,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct ClipboardCacheStore {
+    #[serde(default)]
+    entries: Vec<ClipboardCacheEntry>,
+}
+
+/// One flattened row for the settings "Clipboard Cache" panel.
+#[derive(Serialize, Clone)]
+struct ClipboardCacheRow {
+    row_id: String,
+    source: String, // "snapshot" | "backup"
+    container_id: String,
+    label: String,
+    created_at: String,
+    kind: clipboard::ClipboardKind,
+    order: u32,
+    text: Option<String>,
+    /// Absolute path to the image sidecar (frontend runs it through convertFileSrc).
+    sidecar_path: Option<String>,
+    item_id: String,
+}
+
+fn clipboard_cache_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager;
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Cannot resolve app data dir: {e}"))?;
+    let dir = base.join("ClipboardCache");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create clipboard cache dir: {e}"))?;
+    Ok(dir)
+}
+
+fn clipboard_cache_json(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    Ok(clipboard_cache_dir(app)?.join("cache.json"))
+}
+
+fn load_clipboard_cache(app: &tauri::AppHandle) -> ClipboardCacheStore {
+    let path = match clipboard_cache_json(app) {
+        Ok(p) => p,
+        Err(_) => return ClipboardCacheStore::default(),
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => ClipboardCacheStore::default(),
+    }
+}
+
+fn save_clipboard_cache(app: &tauri::AppHandle, store: &ClipboardCacheStore) -> Result<(), String> {
+    let path = clipboard_cache_json(app)?;
+    let tmp = path.with_extension("json.tmp");
+    let json =
+        serde_json::to_string_pretty(store).map_err(|e| format!("Serialize cache error: {e}"))?;
+    std::fs::write(&tmp, json).map_err(|e| format!("Write cache error: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("Rename cache error: {e}"))
+}
+
+/// Run the (blocking, internally time-boxed) clipboard capture off the async
+/// runtime. Failures come back as warnings — a snapshot is never lost to the
+/// clipboard.
+async fn capture_clipboard_block(
+    dir: &std::path::Path,
+    id: &str,
+) -> (Option<clipboard::ClipboardBlock>, Vec<String>) {
+    let dir = dir.to_path_buf();
+    let id = id.to_string();
+    tauri::async_runtime::spawn_blocking(move || clipboard::capture(&dir, &id))
+        .await
+        .unwrap_or_else(|e| (None, vec![format!("Clipboard capture task failed: {e}")]))
+}
+
+/// Same, for the pre-restore backup.
+async fn backup_current_clipboard_async(
+    app: &tauri::AppHandle,
+    snapshot_name: &str,
+) -> Result<bool, String> {
+    let app = app.clone();
+    let name = snapshot_name.to_string();
+    tauri::async_runtime::spawn_blocking(move || backup_current_clipboard(&app, &name))
+        .await
+        .unwrap_or_else(|e| Err(format!("backup task failed: {e}")))
+}
+
+/// Capture the CURRENT clipboard, persist it atomically to the cache, and verify
+/// it read back. Returns Ok(true) only when a backup is confirmed on disk — or
+/// when there was nothing to back up (clearing is then harmless). Any Ok(false)
+/// or Err means the caller MUST NOT clear the live Win+V history.
+fn backup_current_clipboard(app: &tauri::AppHandle, snapshot_name: &str) -> Result<bool, String> {
+    let dir = clipboard_cache_dir(app)?;
+    let backup_id = format!("backup_{}", chrono::Utc::now().timestamp_millis());
+    let (block, _warnings) = clipboard::capture(&dir, &backup_id);
+    let block = match block {
+        Some(b) if !b.is_empty() => b,
+        _ => return Ok(true), // nothing on the clipboard to preserve
+    };
+    let expected = block.items.len();
+    let entry = ClipboardCacheEntry {
+        id: backup_id.clone(),
+        label: format!("Before restoring {snapshot_name}"),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        block,
+    };
+    let mut store = load_clipboard_cache(app);
+    store.entries.push(entry);
+    while store.entries.len() > MAX_AUTO_BACKUPS {
+        let removed = store.entries.remove(0);
+        for item in &removed.block.items {
+            if let Some(name) = &item.sidecar {
+                let _ = std::fs::remove_file(dir.join(name));
+            }
+        }
+    }
+    save_clipboard_cache(app, &store)?;
+    // Verify the write landed before we allow a destructive clear.
+    let verify = load_clipboard_cache(app);
+    let ok = verify
+        .entries
+        .iter()
+        .any(|e| e.id == backup_id && e.block.items.len() == expected);
+    if !ok {
+        return Err("backup verification failed".into());
+    }
+    Ok(true)
+}
+
+fn clipboard_row(
+    source: &str,
+    container_id: &str,
+    label: &str,
+    created_at: &str,
+    dir: &std::path::Path,
+    item: &clipboard::ClipboardItem,
+) -> ClipboardCacheRow {
+    let sidecar_path = item
+        .sidecar
+        .as_ref()
+        .map(|f| dir.join(f).to_string_lossy().into_owned());
+    let text = item.text.as_ref().map(|t| {
+        let mut s: String = t.chars().take(280).collect();
+        if t.chars().count() > 280 {
+            s.push('…');
+        }
+        s
+    });
+    ClipboardCacheRow {
+        row_id: format!("{source}:{container_id}:{}", item.id),
+        source: source.to_string(),
+        container_id: container_id.to_string(),
+        label: label.to_string(),
+        created_at: created_at.to_string(),
+        kind: item.kind.clone(),
+        order: item.order,
+        text,
+        sidecar_path,
+        item_id: item.id.clone(),
+    }
+}
+
+fn load_clipboard_container(
+    app: &tauri::AppHandle,
+    source: &str,
+    container_id: &str,
+) -> Result<(std::path::PathBuf, clipboard::ClipboardBlock), String> {
+    match source {
+        "snapshot" => {
+            let dir = snapshots_dir(app)?;
+            let snap = try_load_snapshot(&json_path(&dir, container_id))
+                .ok_or_else(|| "snapshot not found".to_string())?;
+            let block = snap
+                .clipboard
+                .ok_or_else(|| "snapshot has no clipboard".to_string())?;
+            Ok((dir, block))
+        }
+        "backup" => {
+            let dir = clipboard_cache_dir(app)?;
+            let store = load_clipboard_cache(app);
+            let entry = store
+                .entries
+                .into_iter()
+                .find(|e| e.id == container_id)
+                .ok_or_else(|| "backup not found".to_string())?;
+            Ok((dir, entry.block))
+        }
+        _ => Err("unknown clipboard source".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn get_capture_clipboard(app: tauri::AppHandle) -> Result<bool, String> {
+    Ok(config::load_config(&app).capture_clipboard)
+}
+
+#[tauri::command]
+async fn set_capture_clipboard(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    let mut cfg = config::load_config(&app);
+    cfg.capture_clipboard = enabled;
+    config::save_config(&app, &cfg)
+}
+
+#[tauri::command]
+async fn list_clipboard_cache(app: tauri::AppHandle) -> Result<Vec<ClipboardCacheRow>, String> {
+    if !config::load_config(&app).capture_clipboard {
+        return Ok(Vec::new());
+    }
+    let mut rows: Vec<ClipboardCacheRow> = Vec::new();
+
+    let sdir = snapshots_dir(&app)?;
+    if let Ok(entries) = std::fs::read_dir(&sdir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let snap = match try_load_snapshot(&path) {
+                Some(s) => s,
+                None => continue,
+            };
+            if let Some(block) = &snap.clipboard {
+                for item in &block.items {
+                    rows.push(clipboard_row(
+                        "snapshot",
+                        &snap.id,
+                        &snap.name,
+                        &block.captured_at,
+                        &sdir,
+                        item,
+                    ));
+                }
+            }
+        }
+    }
+
+    let cdir = clipboard_cache_dir(&app)?;
+    let store = load_clipboard_cache(&app);
+    for e in &store.entries {
+        for item in &e.block.items {
+            rows.push(clipboard_row("backup", &e.id, &e.label, &e.created_at, &cdir, item));
+        }
+    }
+
+    rows.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then(b.order.cmp(&a.order))
+    });
+    Ok(rows)
+}
+
+#[tauri::command]
+async fn copy_clipboard_item(
+    app: tauri::AppHandle,
+    source: String,
+    container_id: String,
+    item_id: String,
+) -> Result<(), String> {
+    let (dir, block) = load_clipboard_container(&app, &source, &container_id)?;
+    let item = block
+        .items
+        .iter()
+        .find(|i| i.id == item_id)
+        .ok_or_else(|| "clipboard item not found".to_string())?
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || clipboard::copy_item(&dir, &item))
+        .await
+        .map_err(|e| format!("copy task failed: {e}"))?
+}
+
+/// Reseed the live Win+V history from one snapshot's stored clipboard block —
+/// the clipboard-only counterpart of a full restore, driven from the details
+/// panel. Same safety invariant: back up and verify the current clipboard first,
+/// and never clear when that backup could not be confirmed. Returns the
+/// warnings so the caller can surface a partial result honestly.
+#[tauri::command]
+async fn restore_clipboard(app: tauri::AppHandle, id: String) -> Result<Vec<String>, String> {
+    let dir = snapshots_dir(&app)?;
+    let snapshot = try_load_snapshot(&json_path(&dir, &id))
+        .ok_or_else(|| format!("Snapshot {id} not found"))?;
+    let block = snapshot
+        .clipboard
+        .clone()
+        .filter(|b| !b.is_empty())
+        .ok_or_else(|| "This snapshot has no captured clipboard".to_string())?;
+
+    let mut warnings = match backup_current_clipboard_async(&app, &snapshot.name).await {
+        Ok(true) => Vec::new(),
+        Ok(false) => vec!["Clipboard pre-restore backup could not be verified".to_string()],
+        Err(e) => vec![format!("Clipboard pre-restore backup failed: {e}")],
+    };
+    let backup_ok = warnings.is_empty();
+    let count = block.items.len();
+    let clip_dir = dir.clone();
+    warnings.extend(
+        tauri::async_runtime::spawn_blocking(move || {
+            clipboard::reseed_history(&clip_dir, &block, backup_ok)
+        })
+        .await
+        .unwrap_or_else(|e| vec![format!("Clipboard reseed task failed: {e}")]),
+    );
+
+    activity::append(
+        &app,
+        activity::event(
+            "restore",
+            Some(snapshot.name.clone()),
+            if warnings.is_empty() { "success" } else { "warning" },
+            format!("Clipboard restored ({count} item{})", if count == 1 { "" } else { "s" }),
+            warnings.clone(),
+        ),
+    );
+    Ok(warnings)
+}
+
+#[tauri::command]
+async fn delete_clipboard_entry(
+    app: tauri::AppHandle,
+    source: String,
+    container_id: String,
+    item_id: String,
+) -> Result<(), String> {
+    match source.as_str() {
+        "snapshot" => {
+            let dir = snapshots_dir(&app)?;
+            let path = json_path(&dir, &container_id);
+            let mut snap =
+                try_load_snapshot(&path).ok_or_else(|| "snapshot not found".to_string())?;
+            if let Some(block) = snap.clipboard.as_mut() {
+                if let Some(pos) = block.items.iter().position(|i| i.id == item_id) {
+                    let removed = block.items.remove(pos);
+                    if let Some(name) = removed.sidecar {
+                        let _ = std::fs::remove_file(dir.join(name));
+                    }
+                }
+                if block.items.is_empty() {
+                    snap.clipboard = None;
+                }
+            }
+            let json = serde_json::to_string_pretty(&snap)
+                .map_err(|e| format!("Serialize error: {e}"))?;
+            let tmp = dir.join(format!("{container_id}_tmp.json"));
+            std::fs::write(&tmp, json).map_err(|e| format!("Write error: {e}"))?;
+            std::fs::rename(&tmp, &path).map_err(|e| format!("Rename error: {e}"))?;
+            Ok(())
+        }
+        "backup" => {
+            let dir = clipboard_cache_dir(&app)?;
+            let mut store = load_clipboard_cache(&app);
+            for e in store.entries.iter_mut() {
+                if e.id == container_id {
+                    if let Some(pos) = e.block.items.iter().position(|i| i.id == item_id) {
+                        let removed = e.block.items.remove(pos);
+                        if let Some(name) = removed.sidecar {
+                            let _ = std::fs::remove_file(dir.join(name));
+                        }
+                    }
+                }
+            }
+            store.entries.retain(|e| !e.block.items.is_empty());
+            save_clipboard_cache(&app, &store)
+        }
+        _ => Err("unknown clipboard source".to_string()),
+    }
+}
+
 // ── App entry point ───────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1141,6 +1694,7 @@ pub fn run() {
             restore_explorer_windows,
             rename_snapshot,
             delete_snapshot,
+            duplicate_snapshot,
             clear_all_snapshots,
             is_current_state_saved,
             get_ignore_list,
@@ -1151,6 +1705,12 @@ pub fn run() {
             set_terminal_hook,
             get_app_icon,
             active_session::get_active_session,
+            get_capture_clipboard,
+            set_capture_clipboard,
+            list_clipboard_cache,
+            copy_clipboard_item,
+            restore_clipboard,
+            delete_clipboard_entry,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1425,5 +1985,60 @@ mod snapshot_schema_tests {
             chrome.restore_hints,
             vec!["browser_tab:chrome:https://example.com"]
         );
+    }
+
+    // ── window_multiset_diff: the drift signal behind the restore-confirm warning ──
+
+    fn win(exe: &str) -> super::WindowInfo {
+        super::WindowInfo {
+            title: String::new(),
+            position: super::WindowPosition { x: 0, y: 0 },
+            size: super::WindowSize { width: 0, height: 0 },
+            state: "normal".into(),
+            monitor_index: 0,
+            exe_path: exe.into(),
+        }
+    }
+
+    fn live(pairs: &[(&str, usize)]) -> std::collections::HashMap<String, usize> {
+        pairs.iter().map(|(s, n)| (s.to_string(), *n)).collect()
+    }
+
+    #[test]
+    fn exact_match_is_zero_diff() {
+        let snap = [win(r"C:\Chrome\chrome.exe"), win(r"C:\Apps\Code.exe")];
+        let now = live(&[("chrome", 1), ("code", 1)]);
+        assert_eq!(super::window_multiset_diff(&now, &snap), 0);
+    }
+
+    #[test]
+    fn opening_another_app_is_drift() {
+        // Snapshot has chrome only; user has since opened notepad.
+        let snap = [win(r"C:\Chrome\chrome.exe")];
+        let now = live(&[("chrome", 1), ("notepad", 1)]);
+        assert_eq!(super::window_multiset_diff(&now, &snap), 1);
+    }
+
+    #[test]
+    fn second_window_of_an_open_app_is_drift() {
+        // Snapshot recorded one Chrome window; two are open now.
+        let snap = [win(r"C:\Chrome\chrome.exe")];
+        let now = live(&[("chrome", 2)]);
+        assert_eq!(super::window_multiset_diff(&now, &snap), 1);
+    }
+
+    #[test]
+    fn closing_an_app_in_the_snapshot_is_drift() {
+        // Snapshot had Explorer + Chrome; Explorer since closed → symmetric diff catches it.
+        let snap = [win(r"C:\Windows\explorer.exe"), win(r"C:\Chrome\chrome.exe")];
+        let now = live(&[("chrome", 1)]);
+        assert_eq!(super::window_multiset_diff(&now, &snap), 1);
+    }
+
+    #[test]
+    fn snapshot_windows_without_an_exe_path_are_ignored() {
+        let snap = [win(""), win(r"C:\Chrome\chrome.exe")];
+        let now = live(&[("chrome", 1), ("notepad", 1)]);
+        assert_eq!(super::window_multiset_diff(&now, &snap), 1);
     }
 }

@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "PC Snapshot",
         "width": 960,
         "height": 640,
@@ -21,6 +22,20 @@
         "fullscreen": false,
         "decorations": false,
         "backgroundColor": "#0F1012"
+      },
+      {
+        "label": "overlay",
+        "url": "index.html",
+        "visible": false,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "focus": false,
+        "shadow": false,
+        "width": 440,
+        "height": 420
       }
     ],
     "security": {

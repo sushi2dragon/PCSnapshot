@@ -516,6 +516,51 @@ fn enumerate_windows() -> Result<Vec<RawWindow>, String> {
     Ok(out)
 }
 
+/// Multiset of the top-level app windows open *right now*, keyed by lowercase exe
+/// stem → how many windows that app owns. This is the live half of the "is the
+/// current desktop already saved?" check, compared against each snapshot's stored
+/// `windows`.
+///
+/// It must stay symmetric with `capture_desktop`: it runs the exact same window
+/// enumeration (`enumerate_windows` — which already drops tool windows, owned
+/// dialogs/popups, and DWM-cloaked UWP ghost windows) and the exact same ignore
+/// filter (`is_ignored` = system-protected + user ignore list). A *different* window
+/// set was the bug behind "your desktop doesn't match any snapshot" appearing right
+/// after a capture: the old live set pulled in cloaked/owned/tool windows
+/// (ApplicationFrameHost et al.) that no snapshot records. Cheap enough (enumeration
+/// + one scoped process refresh, no screenshot/tabs/CWDs) to run on the restore click.
+#[cfg(windows)]
+pub fn current_window_counts(ignore_list: &[String]) -> std::collections::HashMap<String, usize> {
+    use std::collections::HashMap;
+
+    let raw = match enumerate_windows() {
+        Ok(r) => r,
+        Err(_) => return HashMap::new(),
+    };
+
+    let mut pids: Vec<u32> = raw.iter().map(|w| w.pid).collect();
+    pids.sort_unstable();
+    pids.dedup();
+    let meta = process_metadata(&pids);
+
+    // Count windows (not distinct apps) so opening a *second* window of an already-
+    // open app registers as drift; titles/geometry are intentionally excluded so
+    // normal title churn (unread counts, clocks) never flips the result.
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for w in &raw {
+        let Some(m) = meta.get(&w.pid) else { continue };
+        if m.exe_path.is_empty() {
+            continue;
+        }
+        let stem = crate::restore::exe_stem_pub(&m.exe_path);
+        if crate::config::is_ignored(&stem, ignore_list) {
+            continue;
+        }
+        *counts.entry(stem).or_insert(0) += 1;
+    }
+    counts
+}
+
 // ── Non-Windows fallback (keeps the crate cross-compilable) ───────────────────────────────
 
 #[cfg(not(windows))]
@@ -523,4 +568,9 @@ pub fn capture_desktop(_ignore_list: &[String]) -> CapturedDesktop {
     CapturedDesktop::empty_with_warning(
         "Capture engine is only implemented on Windows".to_string(),
     )
+}
+
+#[cfg(not(windows))]
+pub fn current_window_counts(_ignore_list: &[String]) -> std::collections::HashMap<String, usize> {
+    std::collections::HashMap::new()
 }

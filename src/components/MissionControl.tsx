@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getSnapshot, getAppIcon } from "../commands/snapshots";
+import { copyClipboardItem, restoreClipboard } from "../commands/clipboard";
 import type { ActivityEvent, ProcessInfo, Snapshot, SnapshotSummary } from "../types/snapshot";
 import { thumbnailUrl } from "../utils/thumbnail";
 import { SettingsMenu } from "./SettingsMenu";
@@ -10,7 +11,7 @@ type Props = {
   snapshots: SnapshotSummary[]; events: ActivityEvent[]; selectedId: string | null; activeSessionId: string | null;
   onSelect: (id: string | null) => void; onCapture: () => void; onStartNew: () => void;
   onRestore: (id: string) => void; onDelete: (id: string) => void; onRecapture: (id: string) => void;
-  onRename: (id: string) => void;
+  onDuplicate: (id: string) => void; onRename: (id: string) => void;
   onRestoreApp: (id: string, exePath: string, appName: string) => void;
   onRestoreExplorer: (id: string) => void; restoringAppKey: string | null;
   onClearAll: () => void; onImport: () => void; onHelp: () => void; onRefresh: () => void;
@@ -23,6 +24,10 @@ const relative = (stamp: string) => {
   if (d < 86400000) return `Today ${new Date(stamp).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
   return new Date(stamp).toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
 };
+
+// Absolute capture time printed on the tile, e.g. "Jul 21, 2026, 3:26 PM".
+const absTime = (stamp: string) =>
+  new Date(stamp).toLocaleString([], { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
 
 function Icon({ children }: { children: React.ReactNode }) { return <span className="rail-icon">{children}</span>; }
 
@@ -45,20 +50,46 @@ function AppIcon({ proc }: { proc: ProcessInfo }) {
   return <span className="monogram">{proc.name.slice(0, 2)}</span>;
 }
 
+// Compact icon for the tile app-stack, resolved by exe path via the shared cache;
+// falls back to a two-letter monogram derived from the exe stem.
+function MiniAppIcon({ path }: { path: string }) {
+  const [uri, setUri] = useState<string | null | undefined>(() => iconCache.get(path));
+  useEffect(() => {
+    if (iconCache.has(path)) { setUri(iconCache.get(path)); return; }
+    let alive = true;
+    getAppIcon(path)
+      .then(u => { iconCache.set(path, u); if (alive) setUri(u); })
+      .catch(() => { if (alive) setUri(null); });
+    return () => { alive = false; };
+  }, [path]);
+  if (uri) return <img className="mini-icon" src={uri} alt="" />;
+  const stem = (path.split(/[\\/]/).pop() ?? "").replace(/\.exe$/i, "");
+  return <span className="mini-icon mono">{stem.slice(0, 2)}</span>;
+}
+
 export function MissionControl(p: Props) {
   const [search, setSearch] = useState("");
   const [details, setDetails] = useState<Snapshot | null>(null);
   const [showPicker, setShowPicker] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [menuOpenId, setMenuOpenId] = useState<string | null>(null);
+  const [clipOpen, setClipOpen] = useState(false);
+  const [clipCopied, setClipCopied] = useState<{ id: string; ok: boolean } | null>(null);
+  const [clipRestore, setClipRestore] = useState<"idle" | "busy" | "done" | "failed">("idle");
   const [rightWidth, setRightWidth] = useState(290);
   const dragRef = useRef<{ x: number; w: number } | null>(null);
   const onDragMove = (e: MouseEvent) => { if (!dragRef.current) return; setRightWidth(Math.min(480, Math.max(220, dragRef.current.w + (dragRef.current.x - e.clientX)))); };
   const onDragEnd = () => { dragRef.current = null; window.removeEventListener("mousemove", onDragMove); window.removeEventListener("mouseup", onDragEnd); };
   const onDragStart = (e: React.MouseEvent) => { e.preventDefault(); dragRef.current = { x: e.clientX, w: rightWidth }; window.addEventListener("mousemove", onDragMove); window.addEventListener("mouseup", onDragEnd); };
   const searchRef = useRef<HTMLInputElement>(null);
+  const clipCopyTimer = useRef<number | null>(null);
+  const clipRestoreTimer = useRef<number | null>(null);
   const selected = p.snapshots.find(s => s.id === p.selectedId);
   const filtered = useMemo(() => p.snapshots.filter(s => s.name.toLowerCase().includes(search.toLowerCase())), [p.snapshots, search]);
   useEffect(() => {
+    if (clipCopyTimer.current !== null) { window.clearTimeout(clipCopyTimer.current); clipCopyTimer.current = null; }
+    if (clipRestoreTimer.current !== null) { window.clearTimeout(clipRestoreTimer.current); clipRestoreTimer.current = null; }
+    setClipOpen(false); setClipCopied(null); setClipRestore("idle");
     if (!p.selectedId) return;
     let cancelled = false;
     getSnapshot(p.selectedId)
@@ -66,6 +97,14 @@ export function MissionControl(p: Props) {
       .catch(() => { if (!cancelled) setDetails(null); });
     return () => { cancelled = true; };
   }, [p.selectedId, selected?.timestamp]);
+  // Any click outside an open card menu closes it. The kebab toggle stops
+  // propagation, so the opening click never reaches this listener.
+  useEffect(() => {
+    if (!menuOpenId) return;
+    const close = () => setMenuOpenId(null);
+    window.addEventListener("click", close);
+    return () => window.removeEventListener("click", close);
+  }, [menuOpenId]);
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.key.toLowerCase() === "s") { e.preventDefault(); p.onCapture(); }
@@ -102,14 +141,40 @@ export function MissionControl(p: Props) {
     <main className="center-panel">
       {p.snapshots.length === 0 ? <div className="mission-empty"><div className="empty-mark">□</div><h1>Save your first workspace</h1><p>PC Snapshot remembers your open apps, windows, tabs and terminal — so you can bring the whole setup back in one click. Everything stays on this PC.</p><button className="primary" onClick={p.onCapture}>◉ Capture my desktop <kbd>Ctrl S</kbd></button><button className="link" onClick={p.onImport}>or import snapshots from a backup</button></div> : <>
         <div className="grid-header"><h1>All snapshots <small>{p.snapshots.length}</small></h1><div className="search">⌕ <input ref={searchRef} value={search} onChange={e => setSearch(e.target.value)} placeholder="Search or filter"/></div></div>
-        <div className="snapshot-grid">{filtered.map(s => <article key={s.id} className={`snapshot-card ${p.selectedId === s.id ? "selected" : ""} ${s.warning_count ? "has-warning" : "ok"}`} onClick={() => p.onSelect(p.selectedId === s.id ? null : s.id)}>
-          <div className="thumb">{s.thumbnail_path && <img src={thumbnailUrl(s.thumbnail_path, s.timestamp)} alt=""/>}<div className="card-actions"><button onClick={e => {e.stopPropagation(); p.onRestore(s.id)}}>Restore</button><button aria-label={`Recapture ${s.name}`} title="Recapture" onClick={e => {e.stopPropagation(); p.onRecapture(s.id)}}>↻</button><button aria-label={`Delete ${s.name}`} title="Delete" onClick={e => {e.stopPropagation(); p.onDelete(s.id)}}>×</button></div></div>
-          <div className="card-copy"><div className="card-name"><strong>{s.name}</strong><button aria-label={`Rename ${s.name}`} title="Rename" onClick={e => {e.stopPropagation(); p.onRename(s.id)}}><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg></button></div>{p.activeSessionId === s.id
-            ? <span className="working">● <i>Currently working</i></span>
-            : s.warning_count
-              ? <span className="warn">● <i>{s.warning_count} warnings</i></span>
-              : <span className="good">● <i>{relative(s.timestamp)}</i></span>}</div>
-        </article>)}</div>
+        <div className="snapshot-grid">{filtered.map(s => {
+          const working = p.activeSessionId === s.id;
+          const status = working ? "#48b4ff" : s.warning_count ? "#f0b429" : "#46c98b";
+          const ink = working ? "#04121f" : s.warning_count ? "#241a00" : "#06210f";
+          const chip = working ? "Currently working" : s.warning_count ? `${s.warning_count} warning${s.warning_count === 1 ? "" : "s"}` : relative(s.timestamp);
+          const apps = s.top_apps ?? [];
+          return <article key={s.id}
+            className={`snapshot-card ${p.selectedId === s.id ? "selected" : ""} ${menuOpenId === s.id ? "menu-open" : ""} ${working ? "is-working" : ""}`}
+            style={{ "--status": status, "--status-ink": ink } as React.CSSProperties}
+            onClick={() => p.onSelect(p.selectedId === s.id ? null : s.id)}>
+            <div className="card-thumb">
+              {s.thumbnail_path ? <img src={thumbnailUrl(s.thumbnail_path, s.timestamp)} alt=""/> : <div className="thumb-placeholder"/>}
+              <div className="card-scrim"/>
+              <span className="status-chip"><i/>{chip}</span>
+              <div className="card-hover"><button className="card-restore" onClick={e => {e.stopPropagation(); p.onRestore(s.id)}}>Restore</button></div>
+              <button className="card-rename" aria-label={`Rename ${s.name}`} title="Rename" onClick={e => {e.stopPropagation(); p.onRename(s.id)}}><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg></button>
+              <div className="card-overlay">
+                <strong className="card-title">{s.name}</strong>
+                <div className="card-apps">
+                  {apps.length > 0 && <span className="mini-stack">{apps.slice(0, 4).map(path => <MiniAppIcon key={path} path={path}/>)}</span>}
+                  <span className="card-meta">{s.app_count} app{s.app_count === 1 ? "" : "s"} · {s.monitor_count} monitor{s.monitor_count === 1 ? "" : "s"}</span>
+                </div>
+                <span className="card-time">{absTime(s.timestamp)}</span>
+              </div>
+            </div>
+            <button className="thumb-menu-btn" aria-label={`More actions for ${s.name}`} aria-haspopup="menu" aria-expanded={menuOpenId === s.id} title="More" onClick={e => {e.stopPropagation(); setMenuOpenId(id => id === s.id ? null : s.id)}}><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
+            {menuOpenId === s.id && <div className="card-menu" role="menu" onClick={e => e.stopPropagation()}>
+              <button role="menuitem" onClick={e => {e.stopPropagation(); setMenuOpenId(null); p.onRecapture(s.id)}}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>Recapture</button>
+              <button role="menuitem" onClick={e => {e.stopPropagation(); setMenuOpenId(null); p.onDuplicate(s.id)}}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>Duplicate</button>
+              <div className="sep"/>
+              <button role="menuitem" className="danger" onClick={e => {e.stopPropagation(); setMenuOpenId(null); p.onDelete(s.id)}}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>Delete</button>
+            </div>}
+          </article>;
+        })}</div>
       </>}
     </main>
     <aside className={`right-panel ${p.selectedId ? "show-details" : ""}`}>
@@ -157,8 +222,81 @@ export function MissionControl(p: Props) {
               onClick={e => { e.stopPropagation(); if (p.selectedId && proc.exe_path) p.onRestoreApp(p.selectedId, proc.exe_path, appName); }}
             ><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v6h6"/></svg></button></span></div>;
           })}
+          {!!details?.clipboard?.items?.length && (() => {
+            const clip = details.clipboard;
+            const items = [...clip.items].sort((a, b) => b.order - a.order);
+            const dir = details.thumbnail_path.replace(/[^\\/]+$/, "");
+            // Every press re-issues the copy, even while the tick is still
+            // showing — the timer is re-armed rather than left to expire early.
+            // A rejected copy shows a cross rather than nothing: silence here
+            // is what made a wedged clipboard service look like a dead button.
+            const copy = (itemId: string) => {
+              const settle = (ok: boolean) => {
+                if (clipCopyTimer.current !== null) window.clearTimeout(clipCopyTimer.current);
+                setClipCopied({ id: itemId, ok });
+                clipCopyTimer.current = window.setTimeout(() => { clipCopyTimer.current = null; setClipCopied(null); }, ok ? 1400 : 2600);
+              };
+              copyClipboardItem("snapshot", details.id, itemId)
+                .then(() => settle(true))
+                .catch(() => settle(false));
+            };
+            const restoreAll = () => {
+              if (clipRestore === "busy") return;
+              if (clipRestoreTimer.current !== null) window.clearTimeout(clipRestoreTimer.current);
+              setClipRestore("busy");
+              restoreClipboard(details.id)
+                .then(warnings => setClipRestore(warnings.length ? "failed" : "done"))
+                .catch(() => setClipRestore("failed"))
+                .finally(() => {
+                  clipRestoreTimer.current = window.setTimeout(() => { clipRestoreTimer.current = null; setClipRestore("idle"); }, 2200);
+                });
+            };
+            return <div className={`clip-section ${clipOpen ? "open" : ""}`}>
+              <div className="clip-head">
+                <button type="button" className="clip-toggle" aria-expanded={clipOpen} onClick={() => setClipOpen(v => !v)}>
+                  <svg className="clip-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
+                  <span>CLIPBOARD</span>
+                  <small>{items.length} item{items.length === 1 ? "" : "s"}</small>
+                </button>
+                <button type="button" className={`clip-restore-btn ${clipRestore}`} disabled={clipRestore === "busy"}
+                  aria-label="Restore clipboard history"
+                  title={clipRestore === "failed" ? "Clipboard restored with warnings — see Activity" : "Restore this snapshot's clipboard into Win+V (your current clipboard is backed up first)"}
+                  onClick={e => { e.stopPropagation(); restoreAll(); }}>
+                  {clipRestore === "done"
+                    ? <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
+                    : <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v6h6"/></svg>}
+                </button>
+              </div>
+              {clipOpen && <div className="clip-list">{items.map(item => {
+                const isImage = item.kind === "image" && !!item.sidecar;
+                const text = (item.text ?? "").trim();
+                return <div className="clip-row" key={item.id}>
+                  {isImage
+                    ? <img className="clip-thumb" src={thumbnailUrl(dir + item.sidecar, details.timestamp)} alt="Clipboard image"/>
+                    : <span className="clip-glyph" aria-hidden="true">T</span>}
+                  <div className="clip-copy">
+                    <span className="clip-text">{isImage ? "Image" : (text.slice(0, 160) || "(empty)")}</span>
+                    {isImage && <span className="clip-sub">{Math.max(1, Math.round(item.byte_size / 1024))} KB</span>}
+                  </div>
+                  {(() => {
+                    const state = clipCopied?.id === item.id ? (clipCopied.ok ? "copied" : "copy-failed") : "";
+                    return <button type="button" className={`clip-copy-btn ${state}`}
+                      aria-label={isImage ? "Copy image to clipboard" : "Copy text to clipboard"}
+                      title={state === "copy-failed" ? "Copy failed — Windows did not accept the clipboard write" : "Copy to clipboard"}
+                      onClick={e => { e.stopPropagation(); copy(item.id); }}>
+                      {state === "copied"
+                        ? <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
+                        : state === "copy-failed"
+                          ? <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                          : <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>}
+                    </button>;
+                  })()}
+                </div>;
+              })}</div>}
+            </div>;
+          })()}
         </div>
-        <div className="detail-actions"><button className="primary" onClick={() => p.selectedId && p.onRestore(p.selectedId)}>↻ Restore</button><button onClick={() => p.selectedId && p.onRecapture(p.selectedId)}>↻</button><button className="danger" aria-label="Delete" onClick={() => p.selectedId && p.onDelete(p.selectedId)}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></button></div>
+        <div className="detail-actions"><button className="primary restore-action" onClick={() => p.selectedId && p.onRestore(p.selectedId)}>↻ Restore</button><button className="recapture-action" aria-label="Recapture" title="Recapture" onClick={() => p.selectedId && p.onRecapture(p.selectedId)}>↻</button><button className="danger" aria-label="Delete" onClick={() => p.selectedId && p.onDelete(p.selectedId)}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></button></div>
       </section>
     </aside>
     </>}

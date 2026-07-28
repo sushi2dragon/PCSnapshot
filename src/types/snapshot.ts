@@ -77,6 +77,40 @@ export interface ContextClue {
   source: string;
 }
 
+export type ClipboardKind = "text" | "image";
+
+export interface ClipboardItem {
+  id: string;
+  kind: ClipboardKind;
+  /** 0 = oldest; highest order is the newest / top of the Win+V stack. */
+  order: number;
+  text?: string;
+  /** PNG sidecar filename (image items). */
+  sidecar?: string;
+  source: string;
+  byte_size: number;
+}
+
+export interface ClipboardBlock {
+  captured_at: string;
+  items: ClipboardItem[];
+}
+
+/** One flattened row for the settings Clipboard Cache panel. */
+export interface ClipboardCacheRow {
+  row_id: string;
+  source: "snapshot" | "backup";
+  container_id: string;
+  label: string;
+  created_at: string;
+  kind: ClipboardKind;
+  order: number;
+  text?: string | null;
+  /** Absolute path to the image sidecar; run through convertFileSrc. */
+  sidecar_path?: string | null;
+  item_id: string;
+}
+
 export interface Snapshot {
   schema_version?: number;
   id: string;
@@ -91,6 +125,8 @@ export interface Snapshot {
   thumbnail_path: string;
   terminal_sessions?: TerminalSession[];
   browser_sessions?: BrowserSession[];
+  /** Present only when the clipboard opt-in was on at capture time. */
+  clipboard?: ClipboardBlock;
 }
 
 export interface SnapshotSummary {
@@ -99,6 +135,12 @@ export interface SnapshotSummary {
   timestamp: string;
   thumbnail_path: string;
   warning_count: number;
+  /** Captured apps (processes, plus one for File Explorer if any folders were captured). */
+  app_count: number;
+  /** Distinct monitors spanned by the captured windows (at least 1). */
+  monitor_count: number;
+  /** Exe paths of the first few distinct captured apps, for the tile icon stack. */
+  top_apps: string[];
 }
 
 export interface CaptureResult {

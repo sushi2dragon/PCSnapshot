@@ -94,5 +94,13 @@ export function useSnapshots() {
     []
   );
 
-  return { snapshots, loading, capture, recapture, restore, restoreApp, restoreExplorer, remove, rename, refresh };
+  const duplicate = useCallback(
+    async (id: string): Promise<void> => {
+      const created = await commands.duplicateSnapshot(id);
+      setSnapshots((prev) => [created, ...prev]);
+    },
+    []
+  );
+
+  return { snapshots, loading, capture, recapture, restore, restoreApp, restoreExplorer, remove, rename, duplicate, refresh };
 }

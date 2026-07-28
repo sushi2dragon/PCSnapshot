@@ -15,7 +15,7 @@ import { terminalHookStatus, setTerminalHook } from "./commands/config";
 import type { RestoreResult } from "./types/snapshot";
 
 function App() {
-  const { snapshots, loading, capture, recapture, restore, restoreApp, restoreExplorer, remove, rename, refresh } = useSnapshots();
+  const { snapshots, loading, capture, recapture, restore, restoreApp, restoreExplorer, remove, rename, duplicate, refresh } = useSnapshots();
   const [modalOpen, setModalOpen] = useState(false);
   const [toast, setToast] = useState<{ message: string; type: "success" | "warning" } | null>(null);
   const [restoreReport, setRestoreReport] = useState<RestoreResult | null>(null);
@@ -247,6 +247,16 @@ function App() {
     }
   }, [confirmDelete, remove, selectedId, refreshActivity]);
 
+  const handleDuplicate = useCallback(async (id: string) => {
+    try {
+      await duplicate(id);
+      await refreshActivity();
+      setToast({ message: "Snapshot duplicated", type: "success" });
+    } catch (e) {
+      setToast({ message: `Duplicate failed: ${e}`, type: "warning" });
+    }
+  }, [duplicate, refreshActivity]);
+
   const handleRename = useCallback((id: string) => {
     const snapshot = snapshots.find((item) => item.id === id);
     if (snapshot) setRenameTarget({ id, name: snapshot.name });
@@ -331,7 +341,7 @@ function App() {
         activeSessionId={activeId}
         onCapture={handleTakeSnapshot} onStartNew={() => setStartNewOpen(true)} onRestore={handleRestore}
         onRestoreApp={handleRestoreApp} onRestoreExplorer={handleRestoreExplorer} restoringAppKey={restoringAppKey}
-        onDelete={handleDelete} onRecapture={handleRecapture} onRename={handleRename} onClearAll={handleClearAll} onImport={handleImport}
+        onDelete={handleDelete} onRecapture={handleRecapture} onDuplicate={handleDuplicate} onRename={handleRename} onClearAll={handleClearAll} onImport={handleImport}
         onHelp={handleHelp} onRefresh={handleRefresh} onIgnoreList={() => setShowIgnoreList(true)}
         onToggleTerminalHook={handleToggleTerminalHook} terminalHookEnabled={terminalHookEnabled}/>
       <StartNewModal open={startNewOpen} busy={startNewBusy} onCancel={() => setStartNewOpen(false)} onConfirm={handleStartNew}/>

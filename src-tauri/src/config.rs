@@ -30,6 +30,10 @@ pub const SYSTEM_PROTECTED: &[&str] = &[
 pub struct AppConfig {
     #[serde(default)]
     pub ignore_list: Vec<String>,
+    /// Master opt-in for clipboard capture & restore. Off ⇒ the clipboard is
+    /// never read or written and the settings panel is greyed out.
+    #[serde(default)]
+    pub capture_clipboard: bool,
 }
 
 pub fn config_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {

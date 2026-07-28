@@ -4,11 +4,12 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
+    "dev": "node --import ./scripts/local-only.mjs ./node_modules/vite/bin/vite.js",
+    "build": "tsc -b && node --import ./scripts/local-only.mjs ./node_modules/vite/bin/vite.js build",
     "lint": "eslint .",
-    "preview": "vite preview",
-    "test:companion": "node --test companion-extension/test/capture.test.js companion-extension/test/restore.test.js",
+    "preview": "node --import ./scripts/local-only.mjs ./node_modules/vite/bin/vite.js preview",
+    "test": "node --test --import ./scripts/no-network.mjs companion-extension/test/no-network.test.js companion-extension/test/capture.test.js companion-extension/test/restore.test.js",
+    "test:companion": "npm run test",
     "tauri": "tauri"
   },
   "dependencies": {

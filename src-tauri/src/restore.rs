@@ -799,22 +799,9 @@ fn store_app_launch_alias(exe_path: &str) -> Option<&'static str> {
     }
 }
 
-/// Lowercase exe stems of every app that currently owns a visible window.
-/// Used to compare the live desktop against saved snapshots.
-#[cfg(windows)]
-pub fn current_app_set() -> std::collections::HashSet<String> {
-    live_windows()
-        .iter()
-        .filter(|w| !w.exe.is_empty())
-        .map(|w| exe_stem(&w.exe))
-        .filter(|stem| !crate::config::SYSTEM_PROTECTED.contains(&stem.as_str()))
-        .collect()
-}
-
-#[cfg(not(windows))]
-pub fn current_app_set() -> std::collections::HashSet<String> {
-    std::collections::HashSet::new()
-}
+// The "is the live desktop already saved?" window set lives in `capture` now
+// (`capture::current_window_counts`), so it shares the exact window-eligibility and
+// ignore filtering that snapshots are built with. See that function for why.
 
 // tokenize is now pub(crate) in lib.rs — use crate::tokenize everywhere below.
 
@@ -1557,6 +1544,7 @@ pub fn close_all_windows(ignore_list: &[String]) -> (Vec<String>, Vec<String>) {
         schema_version: 2, id: String::new(), name: String::new(), timestamp: String::new(),
         processes: vec![], windows: vec![], explorer_windows: vec![], context_clues: vec![], restore_hints: vec![],
         warnings: vec![], thumbnail_path: String::new(), terminal_sessions: vec![], browser_sessions: vec![],
+        clipboard: None,
     };
     let (mut closed, mut leftover) = close_windows_not_in_snapshot(&empty, ignore_list, false);
     let (explorer_closed, explorer_leftover) = crate::explorer::close_all_folder_windows();
@@ -1824,6 +1812,7 @@ mod tests {
             thumbnail_path: String::new(),
             terminal_sessions,
             browser_sessions: vec![],
+            clipboard: None,
         };
         let proc_ = ProcessInfo {
             name: "WindowsTerminal.exe".into(),
@@ -1951,6 +1940,7 @@ mod tests {
                 },
             ],
             browser_sessions: vec![],
+            clipboard: None,
         };
 
         let mut cursors = HashMap::new();
