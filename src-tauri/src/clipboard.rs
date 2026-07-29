@@ -652,10 +652,31 @@ mod win32 {
         Some(bytes)
     }
 
+    const BI_RGB: u32 = 0;
+    const BI_BITFIELDS: u32 = 3;
+
+    /// Scale a channel value extracted through `mask` up to 8 bits. Handles any
+    /// mask width, so a 5-bit (16bpp) or 8-bit (32bpp) channel both map to 0–255.
+    fn channel8(value: u32, mask: u32) -> u8 {
+        if mask == 0 {
+            return 0;
+        }
+        let shift = mask.trailing_zeros();
+        let width = mask.count_ones();
+        let raw = (value & mask) >> shift;
+        let max = (1u32 << width) - 1;
+        ((raw * 255 + max / 2) / max) as u8
+    }
+
     /// Decode a CF_DIB payload (BITMAPINFOHEADER + pixel rows) to PNG bytes.
-    /// Only uncompressed 24/32bpp is handled — the forms Windows itself puts on
-    /// the clipboard for screenshots and image copies.
-    fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>, String> {
+    ///
+    /// Handles both BI_RGB and BI_BITFIELDS — the latter (compression 3) is what
+    /// Windows uses for most 32bpp clipboard images, and rejecting it was why a
+    /// screenshot on the clipboard came back "unsupported DIB". Channels are
+    /// read through the bitfield masks rather than assumed to be in BGRA byte
+    /// order. Alpha is forced opaque: clipboard bitmaps are opaque, and an
+    /// all-zero alpha mask would otherwise yield a fully transparent PNG.
+    pub fn dib_to_png(dib: &[u8]) -> Result<Vec<u8>, String> {
         if dib.len() < 40 {
             return Err("DIB header truncated".into());
         }
@@ -668,7 +689,7 @@ mod win32 {
         let compression = u32_at(16);
         let palette_entries = u32_at(32) as usize;
 
-        if compression != 0 || !(bit_count == 24 || bit_count == 32) {
+        if !(bit_count == 24 || bit_count == 32) || !(compression == BI_RGB || compression == BI_BITFIELDS) {
             return Err(format!(
                 "unsupported DIB (compression {compression}, {bit_count}bpp)"
             ));
@@ -677,11 +698,26 @@ mod win32 {
             return Err("DIB has no pixels".into());
         }
 
+        // Channel masks. For BI_BITFIELDS they follow a 40-byte header (or live
+        // inside a V4/V5 header at the same offsets); for BI_RGB the layout is
+        // the fixed BGR(A) order.
+        let (r_mask, g_mask, b_mask) = if compression == BI_BITFIELDS {
+            if dib.len() < header_size.max(52) {
+                return Err("DIB bitfield masks truncated".into());
+            }
+            (u32_at(40), u32_at(44), u32_at(48))
+        } else {
+            // BI_RGB stores BGR(A) in memory: blue in the low byte, red high.
+            (0x00FF_0000, 0x0000_FF00, 0x0000_00FF)
+        };
+
         let bottom_up = height > 0;
         let (width, height) = (width as usize, height.unsigned_abs() as usize);
         let bytes_per_px = (bit_count / 8) as usize;
         let stride = ((width * bytes_per_px + 3) / 4) * 4;
-        let offset = header_size + palette_entries * 4;
+        // BI_BITFIELDS with a 40-byte header inserts 3 DWORD masks before pixels.
+        let mask_block = if compression == BI_BITFIELDS && header_size == 40 { 12 } else { 0 };
+        let offset = header_size + mask_block + palette_entries * 4;
         if dib.len() < offset + stride * height {
             return Err("DIB pixel data truncated".into());
         }
@@ -691,8 +727,15 @@ mod win32 {
             let src_row = if bottom_up { height - 1 - row } else { row };
             let start = offset + src_row * stride;
             for px in dib[start..start + width * bytes_per_px].chunks_exact(bytes_per_px) {
-                // Stored BGR(A); 32bpp BI_RGB carries no meaningful alpha.
-                rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
+                let value = if bytes_per_px == 4 {
+                    u32::from_le_bytes([px[0], px[1], px[2], px[3]])
+                } else {
+                    u32::from_le_bytes([px[0], px[1], px[2], 0])
+                };
+                rgba.push(channel8(value, r_mask));
+                rgba.push(channel8(value, g_mask));
+                rgba.push(channel8(value, b_mask));
+                rgba.push(255);
             }
         }
 
@@ -808,6 +851,43 @@ mod tests {
     #[test]
     fn bounded_passes_the_value_through_when_work_finishes_in_time() {
         assert_eq!(bounded("probe", Duration::from_secs(5), || 7), Ok(7));
+    }
+
+    /// A hand-built 2x2 32bpp BI_BITFIELDS DIB — the format that was rejected as
+    /// "unsupported DIB (compression 3, 32bpp)". Masks are the standard BGRA
+    /// layout; decoding must recover the exact colours regardless of byte order.
+    #[test]
+    fn decodes_a_32bpp_bitfields_dib() {
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        dib.extend_from_slice(&2i32.to_le_bytes()); // width
+        dib.extend_from_slice(&2i32.to_le_bytes()); // height (bottom-up)
+        dib.extend_from_slice(&1u16.to_le_bytes()); // planes
+        dib.extend_from_slice(&32u16.to_le_bytes()); // bpp
+        dib.extend_from_slice(&3u32.to_le_bytes()); // BI_BITFIELDS
+        dib.extend_from_slice(&16u32.to_le_bytes()); // biSizeImage
+        dib.extend_from_slice(&0i32.to_le_bytes());
+        dib.extend_from_slice(&0i32.to_le_bytes());
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        dib.extend_from_slice(&0x00FF_0000u32.to_le_bytes()); // red mask
+        dib.extend_from_slice(&0x0000_FF00u32.to_le_bytes()); // green mask
+        dib.extend_from_slice(&0x0000_00FFu32.to_le_bytes()); // blue mask
+        // Pixels are stored B,G,R,X. Bottom-up: first row here is the image's
+        // bottom row. Bottom-left red, bottom-right green, top-left blue, top-right white.
+        let px = |b: u8, g: u8, r: u8| [b, g, r, 0u8];
+        dib.extend_from_slice(&px(0, 0, 255)); // red
+        dib.extend_from_slice(&px(0, 255, 0)); // green
+        dib.extend_from_slice(&px(255, 0, 0)); // blue
+        dib.extend_from_slice(&px(255, 255, 255)); // white
+
+        let png = win32::dib_to_png(&dib).expect("bitfields DIB should decode");
+        let img = image::load_from_memory(&png).expect("re-decode png").to_rgba8();
+        assert_eq!(img.dimensions(), (2, 2));
+        assert_eq!(img.get_pixel(0, 0).0, [0, 0, 255, 255]); // top-left blue
+        assert_eq!(img.get_pixel(1, 0).0, [255, 255, 255, 255]); // top-right white
+        assert_eq!(img.get_pixel(0, 1).0, [255, 0, 0, 255]); // bottom-left red
+        assert_eq!(img.get_pixel(1, 1).0, [0, 255, 0, 255]); // bottom-right green
     }
 
     // The three tests below drive the real system clipboard, so they are

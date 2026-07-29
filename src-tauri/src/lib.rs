@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tauri::Manager;
+use tauri::{
+    menu::{MenuBuilder, MenuItemBuilder},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Manager, WindowEvent,
+};
 
 mod browser;
 mod activity;
@@ -1677,11 +1681,129 @@ async fn delete_clipboard_entry(
 
 // ── App entry point ───────────────────────────────────────────────────────────
 
+/// Use Windows' compositor-driven minimize transition, then remove the minimized
+/// window from the taskbar once the animation has had time to finish.
+#[cfg(target_os = "windows")]
+fn minimize_main_window_to_tray<R: tauri::Runtime>(window: &tauri::Window<R>) {
+    if window.minimize().is_err() {
+        let _ = window.hide();
+        return;
+    }
+
+    let minimized_window = window.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // A fast tray click may already have restored the window. In that case,
+        // do not let this delayed cleanup hide it again underneath the user.
+        if minimized_window.is_minimized().unwrap_or(false) {
+            let _ = minimized_window.hide();
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let browser_bridge = browser_bridge::BrowserBridge::start();
     tauri::Builder::default()
         .manage(browser_bridge)
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                match window.label() {
+                    "main" => {
+                        api.prevent_close();
+                        #[cfg(target_os = "windows")]
+                        minimize_main_window_to_tray(window);
+                        #[cfg(not(target_os = "windows"))]
+                        let _ = window.hide();
+                    }
+                    "overlay" => {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .setup(|app| {
+            #[cfg(target_os = "windows")]
+            if let Some(overlay) = app.get_webview_window("overlay") {
+                use tauri::window::{Color, Effect, EffectsBuilder};
+                let _ = overlay.set_theme(Some(tauri::Theme::Dark));
+                let _ = overlay.set_effects(
+                    EffectsBuilder::new()
+                        .effect(Effect::Acrylic)
+                        .color(Color(18, 20, 24, 220))
+                        .build(),
+                );
+
+                // Round the HWND itself so Acrylic cannot paint a square slab
+                // outside the rounded report card.
+                if let Ok(tauri_hwnd) = overlay.hwnd() {
+                    use windows::Win32::{
+                        Foundation::HWND,
+                        Graphics::Dwm::{
+                            DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE,
+                            DWMWCP_ROUND,
+                        },
+                    };
+                    let hwnd = HWND(tauri_hwnd.0 as *mut std::ffi::c_void);
+                    let preference = DWMWCP_ROUND;
+                    unsafe {
+                        let _ = DwmSetWindowAttribute(
+                            hwnd,
+                            DWMWA_WINDOW_CORNER_PREFERENCE,
+                            &preference as *const _ as *const std::ffi::c_void,
+                            std::mem::size_of_val(&preference) as u32,
+                        );
+                    }
+                }
+            }
+
+            let show_item =
+                MenuItemBuilder::with_id("show", "Show PC Snapshot").build(app)?;
+            let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+            let menu = MenuBuilder::new(app)
+                .items(&[&show_item, &quit_item])
+                .build()?;
+
+            let mut tray = TrayIconBuilder::with_id("main-tray")
+                .menu(&menu)
+                .tooltip("PC Snapshot")
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if matches!(
+                        event,
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        }
+                    ) {
+                        if let Some(window) = tray.app_handle().get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                    }
+                });
+
+            if let Some(icon) = app.default_window_icon().cloned() {
+                tray = tray.icon(icon);
+            }
+            tray.build(app)?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             take_snapshot,
             recapture_snapshot,

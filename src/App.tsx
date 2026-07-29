@@ -13,6 +13,13 @@ import { useActivity } from "./hooks/useActivity";
 import { useActiveSession } from "./hooks/useActiveSession";
 import { terminalHookStatus, setTerminalHook } from "./commands/config";
 import type { RestoreResult } from "./types/snapshot";
+import { emitTo, listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+
+interface RestoreReportEnvelope {
+  id: string;
+  report: RestoreResult;
+}
 
 function App() {
   const { snapshots, loading, capture, recapture, restore, restoreApp, restoreExplorer, remove, rename, duplicate, refresh } = useSnapshots();
@@ -31,11 +38,37 @@ function App() {
   const [renameTarget, setRenameTarget] = useState<{ id: string; name: string } | null>(null);
   const [terminalHookEnabled, setTerminalHookEnabled] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const pendingOverlayReport = useRef<RestoreReportEnvelope | null>(null);
   const [startNewOpen, setStartNewOpen] = useState(false);
   const [startNewBusy, setStartNewBusy] = useState(false);
   const [startNewAfterCapture, setStartNewAfterCapture] = useState(false);
   const { events, refresh: refreshActivity } = useActivity();
   const { activeId, refresh: refreshActive } = useActiveSession();
+
+  const deliverPendingOverlayReport = useCallback(() => {
+    const pending = pendingOverlayReport.current;
+    if (pending) emitTo("overlay", "restore-report", pending).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    const retryTimer = window.setInterval(deliverPendingOverlayReport, 500);
+    const listeners = Promise.all([
+      listen("overlay-ready", deliverPendingOverlayReport),
+      listen<string>("restore-report-received", ({ payload }) => {
+        if (pendingOverlayReport.current?.id !== payload) return;
+        pendingOverlayReport.current = null;
+      }),
+    ]);
+
+    return () => {
+      disposed = true;
+      window.clearInterval(retryTimer);
+      void listeners.then((unlisten) => {
+        if (disposed) unlisten.forEach((removeListener) => removeListener());
+      });
+    };
+  }, [deliverPendingOverlayReport]);
 
   useEffect(() => {
     terminalHookStatus().then(setTerminalHookEnabled).catch(() => {});
@@ -124,6 +157,11 @@ function App() {
       if (!confirmRestore) return;
       const id = confirmRestore.id;
       setConfirmRestore(null);
+      const mainWindow = getCurrentWindow();
+      // A full restore hands the desktop back immediately. Keep this window
+      // hidden throughout the native restore so it cannot flash in front of the
+      // restored apps while the final report is being prepared.
+      await mainWindow.hide().catch(() => {});
       try {
         const result = await restore(id, closeOthers);
         await refreshActivity();
@@ -133,15 +171,19 @@ function App() {
           result.warnings.length > 0 ||
           result.closed_items.length > 0;
         if (!result.success || hasDetail) {
-          setRestoreReport(result);
-        } else {
-          setToast({ message: result.message, type: "success" });
+          pendingOverlayReport.current = {
+            id: crypto.randomUUID(),
+            report: result,
+          };
+          deliverPendingOverlayReport();
         }
       } catch (e) {
+        await mainWindow.show().catch(() => {});
+        await mainWindow.setFocus().catch(() => {});
         setToast({ message: `Restore failed: ${e}`, type: "warning" });
       }
     },
-    [confirmRestore, restore, refreshActivity]
+    [confirmRestore, restore, refreshActivity, deliverPendingOverlayReport]
   );
 
   const handleRestoreApp = useCallback(

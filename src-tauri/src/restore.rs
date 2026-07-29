@@ -542,6 +542,9 @@ pub fn restore_desktop(
         if !Category::from_str(&proc_.classification).is_communication() {
             continue;
         }
+        if crate::config::is_ignored(&exe_stem(&proc_.exe_path), ignore_list) {
+            continue;
+        }
         if running
             .get(&proc_.exe_path.to_ascii_lowercase())
             .copied()
@@ -592,7 +595,8 @@ pub fn restore_desktop(
         .windows
         .iter()
         .filter(|window| {
-            (!companion_managed_browsers
+            !crate::config::is_ignored(&exe_stem(&window.exe_path), ignore_list)
+                && (!companion_managed_browsers
                 || !classify::classify(&window.exe_path, true).is_browser())
                 // Terminals are session-restored, not repositioned — Windows exposes no
                 // reliable way to map a terminal window back to its captured shell.
@@ -667,7 +671,7 @@ pub fn restore_desktop(
         closed_items.extend(closed);
     }
 
-    finalize(snapshot, failed_items, warnings, closed_items)
+    finalize(snapshot, failed_items, warnings, closed_items, ignore_list)
 }
 
 /// Runs the macro layer + builds the result. Separated so the timeout path reuses it.
@@ -677,12 +681,16 @@ fn finalize(
     failed_items: Vec<String>,
     warnings: Vec<String>,
     closed_items: Vec<String>,
+    ignore_list: &[String],
 ) -> RestoreResult {
     // ── Macro: focus the foreground app last so it ends on top ─────────────────────────
     if let Some(fg) = snapshot
         .processes
         .iter()
-        .find(|p| p.classification == "foreground")
+        .find(|p| {
+            p.classification == "foreground"
+                && !crate::config::is_ignored(&exe_stem(&p.exe_path), ignore_list)
+        })
     {
         let live = live_windows();
         if let Some(w) = live

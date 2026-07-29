@@ -10,6 +10,9 @@ use std::path::PathBuf;
 /// closure would break the taskbar, Start menu, IME, or desktop itself.
 /// Lowercased exe stems (no `.exe` suffix).
 pub const SYSTEM_PROTECTED: &[&str] = &[
+    // App control chrome is not part of a restorable workspace. This also makes
+    // legacy snapshots unable to unhide/focus PC Snapshot after a restore.
+    "pc-snapshot",
     "explorer",
     "csrss",
     "svchost",
@@ -83,4 +86,15 @@ pub fn normalize_exe_name(raw: &str) -> String {
         .or_else(|| last.strip_suffix(".EXE"))
         .unwrap_or(last);
     stem.to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_ignored;
+
+    #[test]
+    fn pc_snapshot_is_always_excluded_from_capture_and_restore() {
+        assert!(is_ignored("pc-snapshot", &[]));
+        assert!(is_ignored("PC-SNAPSHOT", &[]));
+    }
 }
