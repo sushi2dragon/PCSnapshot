@@ -13,6 +13,7 @@ pub mod browser_bridge;
 mod capture;
 mod classify;
 mod clipboard;
+mod companion;
 pub(crate) mod config;
 mod context;
 mod explorer;
@@ -725,6 +726,26 @@ async fn close_all_windows(app: tauri::AppHandle) -> Result<CloseResult, String>
         format!("Started fresh · {} windows closed", closed.len()), refused.clone()));
     active_session::clear(&app);
     Ok(CloseResult { closed, refused })
+}
+
+/// Re-run companion setup and report the result together with who is connected.
+/// Safe to call at any time: registration is idempotent and per-user.
+#[tauri::command]
+fn refresh_companion(
+    browser_bridge: tauri::State<'_, browser_bridge::BrowserBridge>,
+) -> companion::CompanionReport {
+    companion::register().into_report(browser_bridge.connected_families())
+}
+
+#[tauri::command]
+fn companion_status(
+    status: tauri::State<'_, companion::CompanionStatus>,
+    browser_bridge: tauri::State<'_, browser_bridge::BrowserBridge>,
+) -> companion::CompanionReport {
+    status
+        .inner()
+        .clone()
+        .into_report(browser_bridge.connected_families())
 }
 
 #[tauri::command]
@@ -1703,9 +1724,14 @@ fn minimize_main_window_to_tray<R: tauri::Runtime>(window: &tauri::Window<R>) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Re-register the native-messaging host on every launch. It is cheap, it is
+    // idempotent, and it is what keeps the browser pointed at *this* build of the
+    // relay instead of a path left behind by an older install or a dev build.
+    let companion_setup = companion::register();
     let browser_bridge = browser_bridge::BrowserBridge::start();
     tauri::Builder::default()
         .manage(browser_bridge)
+        .manage(companion_setup)
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 match window.label() {
@@ -1833,6 +1859,8 @@ pub fn run() {
             copy_clipboard_item,
             restore_clipboard,
             delete_clipboard_entry,
+            companion_status,
+            refresh_companion,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

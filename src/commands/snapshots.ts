@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Snapshot, SnapshotSummary, CaptureResult, RestoreResult, CloseResult, ActiveSession } from "../types/snapshot";
+import type { Snapshot, SnapshotSummary, CaptureResult, RestoreResult, CloseResult, ActiveSession, CompanionReport } from "../types/snapshot";
 
 export async function takeSnapshot(name: string): Promise<CaptureResult> {
   return invoke<CaptureResult>("take_snapshot", { name });
@@ -62,4 +62,14 @@ export async function getActiveSession(): Promise<ActiveSession | null> {
 /** The app's own icon as a PNG data URI, or null if it can't be read. */
 export async function getAppIcon(exePath: string): Promise<string | null> {
   return invoke<string | null>("get_app_icon", { exePath });
+}
+
+/** Browser Companion setup and live-connection state for the Settings page. */
+export async function companionStatus(): Promise<CompanionReport> {
+  return invoke<CompanionReport>("companion_status");
+}
+
+/** Re-run companion registration and return the fresh state. */
+export async function refreshCompanion(): Promise<CompanionReport> {
+  return invoke<CompanionReport>("refresh_companion");
 }

@@ -1,10 +1,11 @@
-import { useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { useIgnoreList } from "../hooks/useIgnoreList";
 import { useClipboard } from "../hooks/useClipboard";
+import { companionStatus, refreshCompanion } from "../commands/snapshots";
 import { KebabMenu } from "./KebabMenu";
-import type { ClipboardCacheRow, SnapshotSummary } from "../types/snapshot";
+import type { ClipboardCacheRow, CompanionReport, SnapshotSummary } from "../types/snapshot";
 
 type Section = "general" | "ignore" | "capture" | "terminal" | "clipboard" | "storage" | "transfer" | "account" | "about";
 
@@ -37,6 +38,54 @@ function Toggle({ checked, label, onClick }: { checked: boolean; label: string; 
 
 function SettingRow({ title, description, action }: { title: string; description: string; action?: React.ReactNode }) {
   return <div className="setting-row"><div><strong>{title}</strong><p>{description}</p></div>{action && <div className="setting-row-action">{action}</div>}</div>;
+}
+
+/**
+ * Live companion state. The companion used to fail silently — a stale native-host
+ * registration or a service worker the browser had shut down both surfaced only
+ * as a warning buried in a restore report. This row answers "is it working right
+ * now?" directly, and re-runs setup on demand.
+ */
+function CompanionRow() {
+  const [report, setReport] = useState<CompanionReport | null>(null);
+  const [checking, setChecking] = useState(true);
+
+  useEffect(() => {
+    let alive = true;
+    companionStatus()
+      .then(next => { if (alive) setReport(next); })
+      .catch(() => {})
+      .finally(() => { if (alive) setChecking(false); });
+    return () => { alive = false; };
+  }, []);
+
+  const recheck = useCallback(async () => {
+    setChecking(true);
+    try {
+      setReport(await refreshCompanion());
+    } catch {
+      setReport(null);
+    } finally {
+      setChecking(false);
+    }
+  }, []);
+
+  const description = !report
+    ? "Checking the browser companion…"
+    : !report.host_installed
+      ? `The companion relay is missing at ${report.host_path}. Reinstall PC Snapshot to restore browser tabs.`
+      : report.connected_browsers.length > 0
+        ? `Connected to ${report.connected_browsers.join(", ")}. Browser tabs are captured and restored exactly.`
+        : "No browser is connected. Install the PC Snapshot Companion extension and open that browser; setup is registered for "
+          + `${report.registered_browsers.join(", ") || "no browsers"}.`;
+
+  return <SettingRow
+    title="Browser companion"
+    description={description}
+    action={<button className="settings-linkish" disabled={checking} onClick={() => { void recheck(); }}>
+      {checking ? "Checking…" : "Check again"}
+    </button>}
+  />;
 }
 
 export function SettingsPage(p: Props) {
@@ -129,7 +178,7 @@ export function SettingsPage(p: Props) {
 
       <section className="settings-section" id="settings-terminal">
         <header className="settings-heading"><div><h1>Terminal & Browser</h1><p>Control optional context collection for richer restores.</p></div></header>
-        <div className="settings-card"><SettingRow title="PowerShell directory capture" description="Adds a small PowerShell profile hook so terminal working directories can be restored." action={<Toggle checked={p.terminalHookEnabled} label="PowerShell directory capture" onClick={p.onToggleTerminalHook}/>}/><SettingRow title="Browser companion" description="Browser tabs are captured when the local companion is connected; failures remain non-fatal."/></div>
+        <div className="settings-card"><SettingRow title="PowerShell directory capture" description="Adds a small PowerShell profile hook so terminal working directories can be restored." action={<Toggle checked={p.terminalHookEnabled} label="PowerShell directory capture" onClick={p.onToggleTerminalHook}/>}/><CompanionRow/></div>
       </section>
 
       <section className="settings-section" id="settings-clipboard">

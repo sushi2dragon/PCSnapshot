@@ -28,6 +28,7 @@ struct Inner {
 
 struct ConnectedSession {
     connection_id: u64,
+    family: String,
     tx: mpsc::UnboundedSender<Value>,
 }
 
@@ -45,9 +46,14 @@ pub struct CaptureReply {
 
 #[derive(Deserialize)]
 struct BrowserRestoreReport {
+    // Reused/opened/skipped are part of the wire protocol and are logged by the
+    // extension; only `closed` and `warnings` reach the desktop restore report.
+    #[allow(dead_code)]
     reused: u32,
+    #[allow(dead_code)]
     opened: u32,
     closed: u32,
+    #[allow(dead_code)]
     skipped: u32,
     #[serde(default)]
     warnings: Vec<String>,
@@ -163,17 +169,16 @@ impl BrowserBridge {
         let mut reply = RestoreReply { closed_items: vec![], warnings: vec![] };
         for target in targets {
             match self.restore_one(target, close_extras, Duration::from_secs(12)).await {
+                // A successful reconciliation is not a warning. Reporting its
+                // reused/opened counts as one made every browser restore surface
+                // the warning overlay, which trained the user to read a working
+                // restore as a failure. Only real problems the extension reports
+                // are warnings now; the closed count is normal restore output.
                 Ok(report) => {
                     if report.closed > 0 {
                         reply.closed_items.push(format!(
                             "{} browser tab(s) closed in {}",
                             report.closed, target.browser.family
-                        ));
-                    }
-                    if report.opened > 0 || report.reused > 0 || report.skipped > 0 {
-                        reply.warnings.push(format!(
-                            "{} browser: {} tab(s) reused, {} opened, {} skipped",
-                            target.browser.family, report.reused, report.opened, report.skipped
                         ));
                     }
                     reply.warnings.extend(report.warnings);
@@ -199,16 +204,9 @@ impl BrowserBridge {
         // takes well over 5s, which made cold restores falsely report the companion
         // as "not connected" and skip tab reconciliation. Wait long enough to cover a
         // cold start; the full deadline only elapses when the companion is truly absent.
-        let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         let tx = loop {
-            let sender = self
-                .inner
-                .sessions
-                .lock()
-                .expect("browser bridge sessions lock poisoned")
-                .get(profile)
-                .map(|session| session.tx.clone());
-            if let Some(sender) = sender {
+            if let Some(sender) = self.resolve_target(profile, &target.browser.family) {
                 break sender;
             }
             if tokio::time::Instant::now() >= connect_deadline {
@@ -239,6 +237,40 @@ impl BrowserBridge {
                 Err("timed out waiting for the companion extension".to_string())
             }
         }
+    }
+
+    /// Browser families with a live companion connection right now, for the
+    /// Settings page's one-glance "is this working?" answer.
+    pub fn connected_families(&self) -> Vec<String> {
+        let sessions = self.inner.sessions.lock().expect("browser bridge sessions lock poisoned");
+        let mut families: Vec<String> =
+            sessions.values().map(|session| session.family.clone()).collect();
+        families.sort();
+        families.dedup();
+        families
+    }
+
+    /// Find the live connection that should service a captured browser profile.
+    ///
+    /// The profile id lives in the extension's own storage, so reinstalling the
+    /// companion — or clearing its data — mints a new one and would otherwise
+    /// strand every snapshot captured before that point behind a permanent
+    /// "not connected for this browser profile". Falling back to the family match
+    /// only when exactly one connected profile shares the family keeps that safe:
+    /// tabs can never be reconciled into a different profile than intended.
+    fn resolve_target(&self, profile: &str, family: &str) -> Option<mpsc::UnboundedSender<Value>> {
+        let sessions = self.inner.sessions.lock().expect("browser bridge sessions lock poisoned");
+        if let Some(session) = sessions.get(profile) {
+            return Some(session.tx.clone());
+        }
+        let mut same_family = sessions
+            .values()
+            .filter(|session| session.family.eq_ignore_ascii_case(family));
+        let only = same_family.next()?;
+        if same_family.next().is_some() {
+            return None;
+        }
+        Some(only.tx.clone())
     }
 
     fn next_request_id(&self) -> String {
@@ -357,7 +389,7 @@ impl BrowserBridge {
                     let key = hello.browser.profile_instance_id;
                     self.inner.sessions.lock().expect("browser bridge sessions lock poisoned").insert(
                         key.clone(),
-                        ConnectedSession { connection_id, tx: tx.clone() },
+                        ConnectedSession { connection_id, family: hello.browser.family, tx: tx.clone() },
                     );
                     profile_id = Some(key);
                 }
@@ -429,6 +461,49 @@ mod tests {
             "capabilities": { "tab_groups": true },
             "windows": []
         })).expect("valid test browser session")
+    }
+
+    fn connect(bridge: &BrowserBridge, profile: &str, family: &str) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        // Hold the receiver open for the life of the test session.
+        std::mem::forget(rx);
+        bridge.inner.sessions.lock().unwrap().insert(
+            profile.to_string(),
+            ConnectedSession { connection_id: 1, family: family.to_string(), tx },
+        );
+    }
+
+    #[test]
+    fn restore_falls_back_to_the_only_profile_of_that_browser_family() {
+        // A reinstalled companion mints a new profile id, so a snapshot captured
+        // before the reinstall can no longer match by id. One connected Chrome is
+        // unambiguous, so it must still be restorable.
+        let bridge = bridge_for_test();
+        connect(&bridge, "profile-new", "chrome");
+        assert!(bridge.resolve_target("profile-old", "chrome").is_some());
+    }
+
+    #[test]
+    fn restore_never_guesses_between_two_profiles_of_the_same_family() {
+        let bridge = bridge_for_test();
+        connect(&bridge, "profile-a", "chrome");
+        connect(&bridge, "profile-b", "chrome");
+        assert!(bridge.resolve_target("profile-old", "chrome").is_none());
+    }
+
+    #[test]
+    fn restore_never_crosses_browser_families() {
+        let bridge = bridge_for_test();
+        connect(&bridge, "profile-edge", "edge");
+        assert!(bridge.resolve_target("profile-old", "chrome").is_none());
+    }
+
+    #[test]
+    fn an_exact_profile_match_always_wins_over_the_family_fallback() {
+        let bridge = bridge_for_test();
+        connect(&bridge, "profile-exact", "chrome");
+        connect(&bridge, "profile-other", "chrome");
+        assert!(bridge.resolve_target("profile-exact", "chrome").is_some());
     }
 
     #[test]

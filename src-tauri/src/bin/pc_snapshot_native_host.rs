@@ -28,11 +28,9 @@ fn main() {}
 
 #[cfg(windows)]
 async fn run() {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::sync::mpsc;
 
-    let pipe = connect_bridge().await;
-    let (read, mut write) = tokio::io::split(pipe);
     let (to_pipe_tx, mut to_pipe_rx) = mpsc::unbounded_channel::<Value>();
     let (to_browser_tx, to_browser_rx) = std::sync::mpsc::channel::<Value>();
 
@@ -44,6 +42,10 @@ async fn run() {
     // wakes it until the user manually reloads the extension. A periodic message
     // resets that idle timer, so the companion stays connected and every capture
     // finds a live session. The extension ignores this message type.
+    //
+    // This starts before the bridge pipe is connected on purpose: the desktop app
+    // may be closed for hours, and the worker must survive that so the very next
+    // capture finds a live session instead of a torn-down companion.
     let heartbeat_tx = to_browser_tx.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(20));
@@ -55,23 +57,60 @@ async fn run() {
         }
     });
 
-    let writer = tokio::spawn(async move {
-        while let Some(message) = to_pipe_rx.recv().await {
-            let Ok(bytes) = serde_json::to_vec(&message) else { continue; };
-            if write.write_all(&bytes).await.is_err() || write.write_all(b"\n").await.is_err() {
-                break;
+    // One browser-owned host process outlives many desktop-app runs. Reconnecting
+    // (instead of exiting when the pipe drops) means closing and reopening PC
+    // Snapshot no longer leaves the extension silently unregistered until the
+    // browser happens to restart the worker. The extension's `hello` is replayed
+    // on each new pipe so the fresh bridge re-registers this profile immediately.
+    let mut hello: Option<Value> = None;
+    loop {
+        let pipe = connect_bridge().await;
+        let (read, mut write) = tokio::io::split(pipe);
+        let mut lines = BufReader::new(read).lines();
+
+        if let Some(greeting) = hello.clone() {
+            if write_line(&mut write, &greeting).await.is_err() {
+                continue;
             }
         }
-    });
 
-    let mut lines = BufReader::new(read).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let Ok(message) = serde_json::from_str::<Value>(&line) else { continue; };
-        if to_browser_tx.send(message).is_err() {
-            break;
+        loop {
+            tokio::select! {
+                outgoing = to_pipe_rx.recv() => {
+                    // `None` means the browser closed the port; the reader thread
+                    // has already exited the process in that case.
+                    let Some(message) = outgoing else { return };
+                    if message.get("type").and_then(Value::as_str) == Some("hello") {
+                        hello = Some(message.clone());
+                    }
+                    if write_line(&mut write, &message).await.is_err() {
+                        break;
+                    }
+                }
+                incoming = lines.next_line() => {
+                    let Ok(Some(line)) = incoming else { break };
+                    let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
+                    if to_browser_tx.send(message).is_err() {
+                        return;
+                    }
+                }
+            }
         }
     }
-    writer.abort();
+}
+
+#[cfg(windows)]
+async fn write_line<W>(write: &mut W, message: &Value) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let Ok(bytes) = serde_json::to_vec(message) else {
+        return Ok(());
+    };
+    write.write_all(&bytes).await?;
+    write.write_all(b"\n").await
 }
 
 #[cfg(windows)]

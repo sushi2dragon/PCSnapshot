@@ -40,11 +40,13 @@ function isRestoreRequest(message) {
     && typeof message?.request_id === "string";
 }
 
-async function replyToCapture(message) {
+async function replyToCapture(activePort, message) {
   console.debug("PC Snapshot capture requested", { requestId: message.request_id });
   const [family, profileId] = await Promise.all([browserFamily(), profileInstanceId()]);
   const browserSession = await captureBrowserSession(api, family, profileId);
-  port?.postMessage({
+  // Answer on the port the request arrived on: a reconnect mid-capture would
+  // otherwise post the result into a port the desktop app is no longer reading.
+  activePort.postMessage({
     protocol_version: 1,
     type: "capture_result",
     request_id: message.request_id,
@@ -56,7 +58,7 @@ async function replyToCapture(message) {
   });
 }
 
-async function replyToRestore(message) {
+async function replyToRestore(activePort, message) {
   console.debug("PC Snapshot browser restore started", {
     requestId: message.request_id,
     closeExtras: message.close_extras,
@@ -66,7 +68,7 @@ async function replyToRestore(message) {
     message.browser_session,
     message.close_extras,
   );
-  port?.postMessage({
+  activePort.postMessage({
     protocol_version: 1,
     type: "restore_result",
     request_id: message.request_id,
@@ -78,17 +80,47 @@ async function replyToRestore(message) {
   });
 }
 
+// Backoff for reconnect attempts. A missing/unregistered host disconnects the
+// port immediately, so an unconditional retry would spawn host processes in a
+// tight loop; the ceiling keeps a broken install cheap while a working one
+// reconnects within a second.
+const RECONNECT_MIN_MS = 1000;
+const RECONNECT_MAX_MS = 60000;
+let reconnectDelayMs = RECONNECT_MIN_MS;
+let reconnectTimer = null;
+
+function scheduleReconnect() {
+  if (reconnectTimer !== null) return;
+  const delay = reconnectDelayMs;
+  reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_MS);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    void connectNative();
+  }, delay);
+}
+
 async function connectNative() {
   if (port) return;
   try {
     const nextPort = api.runtime.connectNative(HOST_NAME);
     port = nextPort;
     nextPort.onDisconnect.addListener(() => {
+      // Chrome does not throw for a missing host; it disconnects asynchronously
+      // and leaves the reason in lastError. Reconnecting here is what keeps the
+      // companion alive across desktop-app restarts and host crashes without the
+      // user ever reloading the extension.
+      console.debug("PC Snapshot native host disconnected", {
+        lastError: api.runtime.lastError?.message,
+      });
       if (port === nextPort) port = null;
+      scheduleReconnect();
     });
     nextPort.onMessage.addListener((message) => {
+      // Any traffic proves the host is healthy; reset the backoff so the next
+      // genuine drop reconnects fast instead of inheriting a long delay.
+      reconnectDelayMs = RECONNECT_MIN_MS;
       if (isCaptureRequest(message)) {
-        replyToCapture(message).catch((error) => {
+        replyToCapture(nextPort, message).catch((error) => {
           nextPort.postMessage({
             protocol_version: 1,
             type: "capture_error",
@@ -99,7 +131,7 @@ async function connectNative() {
         return;
       }
       if (!isRestoreRequest(message)) return;
-      replyToRestore(message).catch((error) => {
+      replyToRestore(nextPort, message).catch((error) => {
         const errorMessage = error instanceof Error ? error.message : "Browser restore failed";
         console.error("PC Snapshot browser restore failed", {
           requestId: message.request_id,
@@ -127,13 +159,12 @@ async function connectNative() {
     });
     console.debug("PC Snapshot native host connected", { family, profileId });
   } catch (error) {
-    // The host is registered by the desktop installer; retry on the next
-    // extension/browser lifecycle event rather than polling in the background.
     console.error("PC Snapshot native host connection failed", {
       error: error instanceof Error ? error.message : error,
       lastError: api.runtime.lastError?.message,
     });
     port = null;
+    scheduleReconnect();
   }
 }
 
@@ -141,11 +172,15 @@ async function connectNative() {
 // connection; nothing re-establishes it until the extension is manually reloaded.
 // A short-period alarm both wakes the worker (each firing resets the idle timer)
 // and reconnects if the port was lost — no user interaction, install-and-forget.
-// The desktop host also heartbeats to keep the worker warm between alarm ticks.
+// The desktop host also heartbeats to keep the worker warm between alarm ticks,
+// and it does so whether or not PC Snapshot itself is running, so the companion
+// no longer goes cold while the app is closed.
 const KEEPALIVE_ALARM = "pcs-companion-keepalive";
 
 function ensureKeepaliveAlarm() {
-  api.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.4 });
+  // Chrome clamps released extensions to a 30s floor; asking for less only makes
+  // the effective period unpredictable. The host heartbeat is the real keepalive.
+  api.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
 }
 
 api.alarms.onAlarm.addListener((alarm) => {

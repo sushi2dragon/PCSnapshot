@@ -169,3 +169,13 @@ export interface ActiveSession {
   id: string;
   timestamp: string;
 }
+
+/** Browser Companion health: host registration plus who is connected right now. */
+export interface CompanionReport {
+  /** The native-messaging relay exists beside the app; nothing works without it. */
+  host_installed: boolean;
+  host_path: string;
+  registered_browsers: string[];
+  errors: string[];
+  connected_browsers: string[];
+}

@@ -90,7 +90,11 @@ export async function reconcileBrowserSession(api, targetSession, closeExtras) {
   });
   const warnings = [];
   const createdBlankTabIds = [];
-  const result = { reused: 0, opened: 0, closed: 0, skipped: 0, warnings };
+  // `ignored` counts pages that were never restorable in the first place — the
+  // new-tab page, settings, devtools. Every profile has some, and reporting them
+  // as skipped work made a clean restore look like a failed one. `skipped` now
+  // means only "this should have been restored and wasn't".
+  const result = { reused: 0, opened: 0, closed: 0, skipped: 0, ignored: 0, warnings };
 
   for (let ordinal = 0; ordinal < plan.windows.length; ordinal += 1) {
     const plannedWindow = plan.windows[ordinal];
@@ -117,8 +121,11 @@ export async function reconcileBrowserSession(api, targetSession, closeExtras) {
     for (const plannedTab of plannedWindow.tabs) {
       const { target } = plannedTab;
       if (plannedTab.action === "skip") {
-        result.skipped += 1;
-        warnings.push(`Skipped non-restorable browser page: ${target.url || target.title}`);
+        result.ignored += 1;
+        console.debug("PC Snapshot ignored a non-restorable browser page", {
+          url: target.url,
+          title: target.title,
+        });
         continue;
       }
       let runtimeTabId;
