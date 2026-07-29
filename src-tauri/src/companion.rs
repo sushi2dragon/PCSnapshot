@@ -176,6 +176,11 @@ pub fn register() -> CompanionStatus {
     status
 }
 
+// Deliberately untested by `cargo test`: registration resolves its host path from
+// `current_exe()` and writes the real HKCU hive, so a test would both read the
+// wrong executable (the test harness) and clobber the machine's live setup. It is
+// verified by launching the app and reading Settings → Terminal & Browser.
+
 #[cfg(not(windows))]
 pub fn register() -> CompanionStatus {
     CompanionStatus {
