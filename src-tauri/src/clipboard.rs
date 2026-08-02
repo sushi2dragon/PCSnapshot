@@ -34,12 +34,12 @@ const REPLAY_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_mi
 const REPLAY_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// ## Why every WinRT call below is time-boxed
-/// The Windows clipboard history service (cbdhsvc) can stop answering — most
-/// reliably right after a `ClearHistory()` + rapid `SetContent` replay. Its
-/// WinRT calls then block *forever*, with no error and no timeout of their own.
-/// Because `take_snapshot` awaits clipboard capture, one wedged call used to
-/// take the whole app down with it: capture, recapture and copy all hung and
-/// nothing was ever written or logged.
+/// A WinRT clipboard call can block *forever*, with no error and no timeout of
+/// its own — whether because the history service stops answering or because the
+/// process that owns the copied data never completes the transfer. Because
+/// `take_snapshot` awaits clipboard capture, one wedged call used to take the
+/// whole app down with it: capture, recapture and copy all hung and nothing was
+/// ever written or logged.
 ///
 /// So no clipboard call may block its caller. Each runs on its own detached
 /// thread behind a bounded wait: a wedged service costs one leaked thread and
@@ -56,10 +56,11 @@ fn bounded<T: Send + 'static>(
         let _ = tx.send(work());
     });
     rx.recv_timeout(timeout).map_err(|_| {
-        format!(
-            "{what} timed out after {}s — the Windows clipboard history service is not responding",
-            timeout.as_secs()
-        )
+        // Deliberately does not name a cause: the old wording blamed the
+        // clipboard history service, which sent debugging down the wrong path
+        // for weeks while the real fault was an MTA thread that could never
+        // receive the OLE completion.
+        format!("{what} did not finish within {:.1}s", timeout.as_secs_f32())
     })
 }
 
@@ -147,27 +148,85 @@ mod win {
     use windows::ApplicationModel::DataTransfer::{
         Clipboard, ClipboardHistoryItemsResultStatus, StandardDataFormats,
     };
+    use windows::core::Interface;
+    use windows::Foundation::{AsyncStatus, IAsyncOperation};
     use windows::Storage::Streams::{DataReader, RandomAccessStreamReference};
-    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+    };
 
     /// Initialize the thread for WinRT/COM. Safe to call repeatedly; a benign
     /// "already initialized" / "changed mode" result is ignored.
+    ///
+    /// ## Why STA and not MTA
+    /// Reading a clipboard item's *content* (`DataPackageView::GetTextAsync` and
+    /// friends) is fulfilled by the process that owns the data, over OLE — and
+    /// that completion is delivered as a window message. On an MTA thread it can
+    /// never arrive, so the call blocks forever: measured here as a 62ms history
+    /// list read of 27 items followed by a permanent hang on the first item's
+    /// content, which is exactly the 3s `bounded` timeout users saw. Clipboard
+    /// WinRT calls must therefore run on an STA thread, and every async wait must
+    /// pump messages — see `pump_get`.
     fn ensure_com() {
         unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         }
     }
+
+    /// Await a WinRT async operation on an STA thread.
+    ///
+    /// `IAsyncOperation::get()` blocks the thread outright, which deadlocks an
+    /// STA whose completion arrives as a window message. This polls the
+    /// operation's status and drains the thread's message queue while it waits,
+    /// so the completion can actually be delivered.
+    ///
+    /// `timeout` is a backstop, not the normal path: without it an unresponsive
+    /// clipboard owner would still park the worker thread forever.
+    fn pump_get<T>(op: &IAsyncOperation<T>, timeout: std::time::Duration) -> windows::core::Result<T>
+    where
+        T: windows::core::RuntimeType + 'static,
+    {
+        let deadline = std::time::Instant::now() + timeout;
+        while op.Status()? == AsyncStatus::Started {
+            if std::time::Instant::now() >= deadline {
+                let _ = op.Cancel();
+                // HRESULT_FROM_WIN32(ERROR_TIMEOUT)
+                return Err(windows::core::Error::new(
+                    windows::core::HRESULT(-2147023436),
+                    "clipboard operation timed out",
+                ));
+            }
+            unsafe {
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, HWND::default(), 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        op.GetResults()
+    }
+
+    /// Per-call ceiling for one WinRT async operation inside a clipboard read.
+    /// Deliberately short: a wedged clipboard owner should cost one item, not
+    /// the whole history.
+    const OP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1_200);
 
     fn read_stream_bytes(
         stream_ref: &RandomAccessStreamReference,
     ) -> windows::core::Result<Vec<u8>> {
-        let stream = stream_ref.OpenReadAsync()?.get()?;
+        let stream = pump_get(&stream_ref.OpenReadAsync()?, OP_TIMEOUT)?;
         let size = stream.Size()?;
         if size == 0 {
             return Ok(Vec::new());
         }
         let reader = DataReader::CreateDataReader(&stream)?;
-        reader.LoadAsync(size as u32)?.get()?;
+        // LoadAsync hands back DataReaderLoadOperation, not IAsyncOperation<u32>.
+        let load: IAsyncOperation<u32> = reader.LoadAsync(size as u32)?.cast()?;
+        pump_get(&load, OP_TIMEOUT)?;
         let mut buf = vec![0u8; size as usize];
         reader.ReadBytes(&mut buf)?;
         Ok(buf)
@@ -199,7 +258,7 @@ mod win {
         // --- Win+V history (primary source) ---
         let history_enabled = Clipboard::IsHistoryEnabled().unwrap_or(false);
         if history_enabled {
-            match Clipboard::GetHistoryItemsAsync().and_then(|op| op.get()) {
+            match Clipboard::GetHistoryItemsAsync().and_then(|op| pump_get(&op, OP_TIMEOUT)) {
                 Ok(result) => {
                     let ok = result
                         .Status()
@@ -293,7 +352,7 @@ mod win {
         if has_text {
             let text: String = content
                 .GetTextAsync()
-                .and_then(|op| op.get())
+                .and_then(|op| pump_get(&op, OP_TIMEOUT))
                 .map(|h| h.to_string_lossy())
                 .map_err(|e| format!("{e}"))?;
             let size = text.len() as u64;
@@ -315,7 +374,7 @@ mod win {
         if has_bitmap {
             let stream_ref = content
                 .GetBitmapAsync()
-                .and_then(|op| op.get())
+                .and_then(|op| pump_get(&op, OP_TIMEOUT))
                 .map_err(|e| format!("{e}"))?;
             let raw = read_stream_bytes(&stream_ref).map_err(|e| format!("{e}"))?;
             if raw.is_empty() {
@@ -351,7 +410,7 @@ mod win {
     /// read. Cheap — it counts the result list without touching item content.
     pub fn history_len() -> Option<usize> {
         ensure_com();
-        let result = Clipboard::GetHistoryItemsAsync().and_then(|op| op.get()).ok()?;
+        let result = Clipboard::GetHistoryItemsAsync().and_then(|op| pump_get(&op, OP_TIMEOUT)).ok()?;
         let ok = result
             .Status()
             .map(|s| s == ClipboardHistoryItemsResultStatus::Success)
@@ -848,6 +907,38 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// The regression this guards: clipboard capture returned a single item and
+    /// "Clipboard capture timed out after 3s" on a machine whose history service
+    /// was healthy. The history *list* read was fast (62ms for 27 items); the
+    /// hang was in reading each item's content from an MTA thread, where the OLE
+    /// completion — a window message — can never be delivered. Runs the real
+    /// `capture`, so it exercises `bounded` -> STA `ensure_com` -> `pump_get`.
+    ///
+    /// Ignored by default: it needs a live Win+V history with more than one item.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn capture_reads_the_whole_winv_history() {
+        let dir = std::env::temp_dir().join("pcsnap-clip-verify");
+        std::fs::create_dir_all(&dir).unwrap();
+        let started = std::time::Instant::now();
+        let (block, warnings) = capture(&dir, "verify");
+        println!("capture took {:?}, warnings={warnings:?}", started.elapsed());
+        let block = block.expect("a clipboard block");
+        for i in &block.items {
+            println!("  order={} {:?} source={} {}B", i.order, i.kind, i.source, i.byte_size);
+        }
+        assert!(
+            !warnings.iter().any(|w| w.contains("timed out")),
+            "capture timed out: {warnings:?}"
+        );
+        assert!(
+            block.items.len() > 1,
+            "expected the Win+V history, got {} item(s)",
+            block.items.len()
+        );
+    }
+
     #[test]
     fn bounded_passes_the_value_through_when_work_finishes_in_time() {
         assert_eq!(bounded("probe", Duration::from_secs(5), || 7), Ok(7));
@@ -1115,7 +1206,7 @@ mod tests {
             std::thread::sleep(Duration::from_secs(30));
         })
         .unwrap_err();
-        assert!(err.contains("timed out"), "unexpected message: {err}");
+        assert!(err.contains("did not finish within 0.1s"), "unexpected message: {err}");
     }
 }
 

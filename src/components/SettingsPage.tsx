@@ -90,6 +90,15 @@ function CompanionRow() {
 
 export function SettingsPage(p: Props) {
   const [activeSection, setActiveSection] = useState<Section>("general");
+  // The overlay owns its own dismissal so the exit animation can play out before
+  // the parent unmounts it. Every close path (× button, backdrop, Escape) routes here.
+  const [closing, setClosing] = useState(false);
+  const onCloseRef = useRef(p.onClose);
+  onCloseRef.current = p.onClose;
+  const close = useCallback(() => {
+    setClosing(true);
+    window.setTimeout(() => onCloseRef.current(), 260);
+  }, []);
   const contentRef = useRef<HTMLDivElement>(null);
   const [ignoreQuery, setIgnoreQuery] = useState("");
   const [pickerQuery, setPickerQuery] = useState("");
@@ -117,6 +126,15 @@ export function SettingsPage(p: Props) {
     catch (e) { setError(String(e)); }
   };
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (pickerOpen) setPickerOpen(false); else close();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [pickerOpen, close]);
+
   const jumpToSection = (key: Section) => {
     const target = contentRef.current?.querySelector<HTMLElement>(`#settings-${key}`);
     if (!target) return;
@@ -140,9 +158,12 @@ export function SettingsPage(p: Props) {
     setActiveSection(visible);
   };
 
-  return <section className="settings-page" aria-label="Settings">
+  return createPortal(<div className={`settings-overlay ${closing ? "closing" : ""}`} role="dialog" aria-modal="true" aria-label="Settings"
+    onMouseDown={e => e.target === e.currentTarget && close()}>
+    <section className="settings-page">
+    <button className="settings-close" aria-label="Close settings" onClick={close}>×</button>
     <nav className="settings-nav" aria-label="Settings sections">
-      <div className="settings-nav-head"><span>Settings</span><button aria-label="Close settings" onClick={p.onClose}>×</button></div>
+      <div className="settings-nav-head"><span>Settings</span></div>
       {sections.map(item => <button key={item.key} className={activeSection === item.key ? "active" : ""} aria-current={activeSection === item.key ? "location" : undefined} onClick={() => jumpToSection(item.key)}>{item.label}</button>)}
     </nav>
     <div className="settings-content" ref={contentRef} onScroll={trackVisibleSection}>
@@ -232,5 +253,6 @@ export function SettingsPage(p: Props) {
         <div className="settings-card"><SettingRow title="Keyboard shortcuts" description="Ctrl+S Capture · Ctrl+K Search · Enter Restore · Delete Remove · Escape Back" action={<button className="settings-secondary" onClick={p.onHelp}>Show help</button>}/><SettingRow title="Privacy" description="Everything stays on this PC."/></div>
       </section>
     </div>
-  </section>;
+    </section>
+  </div>, document.body);
 }

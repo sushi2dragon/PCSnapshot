@@ -31,6 +31,27 @@ pub fn append(app: &tauri::AppHandle, event: ActivityEvent) {
     }
 }
 
+#[derive(Serialize)]
+pub struct ActivityLog {
+    pub path: String,
+    pub text: String,
+}
+
+/// The raw log tail (oldest first), for the "Show logs" viewer. Returned
+/// verbatim rather than parsed so a malformed line is still visible to the
+/// user, where `list_activity` silently drops it.
+#[tauri::command]
+pub fn read_activity_log(app: tauri::AppHandle, lines: Option<usize>) -> Result<ActivityLog, String> {
+    let mut path = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    path.push("Snapshots/activity.jsonl");
+    let display = path.to_string_lossy().to_string();
+    if !path.exists() { return Ok(ActivityLog { path: display, text: String::new() }); }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("Activity read error: {e}"))?;
+    let all: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = all.len().saturating_sub(lines.unwrap_or(200).min(1000));
+    Ok(ActivityLog { path: display, text: all[start..].join("\n") })
+}
+
 #[tauri::command]
 pub fn list_activity(app: tauri::AppHandle, limit: Option<usize>) -> Result<Vec<ActivityEvent>, String> {
     let mut path = app.path().app_data_dir().map_err(|e| e.to_string())?;

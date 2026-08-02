@@ -1837,6 +1837,7 @@ pub fn run() {
             get_snapshot,
             close_all_windows,
             activity::list_activity,
+            activity::read_activity_log,
             restore_snapshot,
             restore_app,
             restore_explorer_windows,
