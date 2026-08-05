@@ -21,7 +21,7 @@
         "resizable": true,
         "fullscreen": false,
         "decorations": false,
-        "backgroundColor": "#0F1012"
+        "transparent": true
       },
       {
         "label": "overlay",

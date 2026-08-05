@@ -1536,6 +1536,148 @@ async fn set_capture_clipboard(app: tauri::AppHandle, enabled: bool) -> Result<(
     config::save_config(&app, &cfg)
 }
 
+/// One tab as shown on the Browser Companion settings page.
+#[derive(Serialize)]
+struct CompanionTab {
+    title: String,
+    url: String,
+}
+
+/// A browser the companion knows about, plus the tabs from its most recent
+/// capture. Drives the Browser Companion settings page.
+#[derive(Serialize)]
+struct CompanionBrowser {
+    family: String,
+    /// Live native-messaging connection right now.
+    connected: bool,
+    /// ISO timestamp of the snapshot the tabs below came from, if any.
+    last_captured_at: Option<String>,
+    last_snapshot_name: Option<String>,
+    tab_count: usize,
+    tabs: Vec<CompanionTab>,
+}
+
+/// Browsers seen by the companion — currently connected and/or previously
+/// captured — each with the tab list from its newest captured session. Powers
+/// the Browser Companion settings page; independent of any opt-in flag.
+#[tauri::command]
+async fn browser_companion_overview(
+    app: tauri::AppHandle,
+    browser_bridge: tauri::State<'_, browser_bridge::BrowserBridge>,
+) -> Result<Vec<CompanionBrowser>, String> {
+    use std::collections::HashMap;
+
+    let connected = browser_bridge.connected_families();
+
+    // Newest captured session per family. Walk every snapshot once, keeping the
+    // session whose captured_at sorts highest for each family (ISO 8601 sorts
+    // lexically, so a string compare is a time compare).
+    struct Latest {
+        captured_at: String,
+        snapshot_name: String,
+        tabs: Vec<CompanionTab>,
+    }
+    let mut latest: HashMap<String, Latest> = HashMap::new();
+
+    let sdir = snapshots_dir(&app)?;
+    if let Ok(entries) = std::fs::read_dir(&sdir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let snap = match try_load_snapshot(&path) {
+                Some(s) => s,
+                None => continue,
+            };
+            for session in &snap.browser_sessions {
+                let family = session.browser.family.clone();
+                let newer = latest
+                    .get(&family)
+                    .map(|cur| session.captured_at > cur.captured_at)
+                    .unwrap_or(true);
+                if !newer {
+                    continue;
+                }
+                let tabs: Vec<CompanionTab> = session
+                    .windows
+                    .iter()
+                    .flat_map(|w| w.tabs.iter())
+                    .map(|t| CompanionTab {
+                        title: t.title.clone(),
+                        url: t.url.clone(),
+                    })
+                    .collect();
+                latest.insert(
+                    family,
+                    Latest {
+                        captured_at: session.captured_at.clone(),
+                        snapshot_name: snap.name.clone(),
+                        tabs,
+                    },
+                );
+            }
+        }
+    }
+
+    // Union of connected-now and ever-captured families.
+    let mut families: Vec<String> = connected.clone();
+    for family in latest.keys() {
+        if !families.contains(family) {
+            families.push(family.clone());
+        }
+    }
+
+    let mut out: Vec<CompanionBrowser> = families
+        .into_iter()
+        .map(|family| {
+            let is_connected = connected.contains(&family);
+            match latest.remove(&family) {
+                Some(l) => CompanionBrowser {
+                    family,
+                    connected: is_connected,
+                    last_captured_at: Some(l.captured_at),
+                    last_snapshot_name: Some(l.snapshot_name),
+                    tab_count: l.tabs.len(),
+                    tabs: l.tabs,
+                },
+                None => CompanionBrowser {
+                    family,
+                    connected: is_connected,
+                    last_captured_at: None,
+                    last_snapshot_name: None,
+                    tab_count: 0,
+                    tabs: Vec::new(),
+                },
+            }
+        })
+        .collect();
+
+    // Connected browsers first, then by most-recent capture.
+    out.sort_by(|a, b| {
+        b.connected
+            .cmp(&a.connected)
+            .then(b.last_captured_at.cmp(&a.last_captured_at))
+            .then(a.family.cmp(&b.family))
+    });
+    Ok(out)
+}
+
+/// Open a URL in the user's default browser. Uses the Windows shell via
+/// explorer.exe so there is no console flash and no extra dependency.
+#[tauri::command]
+async fn open_external(url: String) -> Result<(), String> {
+    // Only allow web URLs; never let this become a launch-anything primitive.
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("Only http(s) URLs can be opened".into());
+    }
+    std::process::Command::new("explorer")
+        .arg(&url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Could not open {url}: {e}"))
+}
+
 #[tauri::command]
 async fn list_clipboard_cache(app: tauri::AppHandle) -> Result<Vec<ClipboardCacheRow>, String> {
     if !config::load_config(&app).capture_clipboard {
@@ -1722,6 +1864,47 @@ fn minimize_main_window_to_tray<R: tauri::Runtime>(window: &tauri::Window<R>) {
     });
 }
 
+/// Extend the DWM frame across the entire client area. Without this a system
+/// backdrop (Mica/Acrylic) is accepted but never drawn on an undecorated window.
+#[cfg(target_os = "windows")]
+fn extend_frame_into_client_area(window: &tauri::WebviewWindow) {
+    use windows::Win32::{
+        Foundation::HWND, Graphics::Dwm::DwmExtendFrameIntoClientArea, UI::Controls::MARGINS,
+    };
+    let Ok(tauri_hwnd) = window.hwnd() else { return };
+    let hwnd = HWND(tauri_hwnd.0 as *mut std::ffi::c_void);
+    let margins = MARGINS {
+        cxLeftWidth: -1,
+        cxRightWidth: -1,
+        cyTopHeight: -1,
+        cyBottomHeight: -1,
+    };
+    unsafe {
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+    }
+}
+
+/// Ask DWM to round the window's own corners. A transparent, undecorated window
+/// otherwise composites as a hard rectangle against the desktop.
+#[cfg(target_os = "windows")]
+fn round_window_corners(window: &tauri::WebviewWindow) {
+    use windows::Win32::{
+        Foundation::HWND,
+        Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND},
+    };
+    let Ok(tauri_hwnd) = window.hwnd() else { return };
+    let hwnd = HWND(tauri_hwnd.0 as *mut std::ffi::c_void);
+    let preference = DWMWCP_ROUND;
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &preference as *const _ as *const std::ffi::c_void,
+            std::mem::size_of_val(&preference) as u32,
+        );
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Re-register the native-messaging host on every launch. It is cheap, it is
@@ -1751,6 +1934,37 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // The main window is transparent and carries a system backdrop, so the
+            // shell reads as glass rather than as a flat slab. Acrylic first: it
+            // blurs whatever is actually behind the window, which is what makes the
+            // effect visible on a dark desktop — Mica only tints with the wallpaper
+            // and disappears against a dark one. Mica is the fallback. Both are
+            // cosmetic; failure leaves a plain dark window.
+            #[cfg(target_os = "windows")]
+            if let Some(main) = app.get_webview_window("main") {
+                use tauri::window::{Color, Effect, EffectsBuilder};
+                let _ = main.set_theme(Some(tauri::Theme::Dark));
+                if main
+                    .set_effects(
+                        EffectsBuilder::new()
+                            .effect(Effect::Acrylic)
+                            .color(Color(12, 13, 16, 190))
+                            .build(),
+                    )
+                    .is_err()
+                {
+                    let _ =
+                        main.set_effects(EffectsBuilder::new().effect(Effect::MicaDark).build());
+                }
+                // A system backdrop only paints where the window frame reaches. On a
+                // decorations:false window the frame is nothing, so DWM sets the
+                // attribute and renders nothing — the window stays opaque. Extending
+                // the frame across the whole client area (-1 margins) is what makes
+                // Acrylic actually appear behind the page.
+                extend_frame_into_client_area(&main);
+                round_window_corners(&main);
+            }
+
             #[cfg(target_os = "windows")]
             if let Some(overlay) = app.get_webview_window("overlay") {
                 use tauri::window::{Color, Effect, EffectsBuilder};
@@ -1856,6 +2070,8 @@ pub fn run() {
             active_session::get_active_session,
             get_capture_clipboard,
             set_capture_clipboard,
+            browser_companion_overview,
+            open_external,
             list_clipboard_cache,
             copy_clipboard_item,
             restore_clipboard,

@@ -368,7 +368,7 @@ function App() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center min-h-screen" style={{ backgroundColor: "var(--bg-base)" }}>
+      <div className="app-loading flex items-center justify-center min-h-screen">
         <div
           className="w-7 h-7 rounded-full border-2 animate-spin"
           style={{ borderColor: "var(--border-subtle)", borderTopColor: "var(--color-accent)" }}
@@ -378,7 +378,7 @@ function App() {
   }
 
   return (
-    <div style={{ height: "100vh", backgroundColor: "var(--bg-base)" }}>
+    <div className="app-surface">
       <MissionControl snapshots={snapshots} events={events} selectedId={selectedId} onSelect={setSelectedId}
         activeSessionId={activeId}
         onCapture={handleTakeSnapshot} onStartNew={() => setStartNewOpen(true)} onRestore={handleRestore}

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Snapshot, SnapshotSummary, CaptureResult, RestoreResult, CloseResult, ActiveSession, CompanionReport } from "../types/snapshot";
+import type { Snapshot, SnapshotSummary, CaptureResult, RestoreResult, CloseResult, ActiveSession, CompanionReport, CompanionBrowser } from "../types/snapshot";
 
 export async function takeSnapshot(name: string): Promise<CaptureResult> {
   return invoke<CaptureResult>("take_snapshot", { name });
@@ -72,4 +72,10 @@ export async function companionStatus(): Promise<CompanionReport> {
 /** Re-run companion registration and return the fresh state. */
 export async function refreshCompanion(): Promise<CompanionReport> {
   return invoke<CompanionReport>("refresh_companion");
+}
+
+/** Browsers the companion knows about (connected and/or captured) with each
+ *  one's most recently captured tabs — for the Browser Companion settings page. */
+export async function browserCompanionOverview(): Promise<CompanionBrowser[]> {
+  return invoke<CompanionBrowser[]>("browser_companion_overview");
 }

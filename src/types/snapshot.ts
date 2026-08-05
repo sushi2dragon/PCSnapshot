@@ -179,3 +179,19 @@ export interface CompanionReport {
   errors: string[];
   connected_browsers: string[];
 }
+
+export interface CompanionTab {
+  title: string;
+  url: string;
+}
+
+/** A browser the companion knows about, with the tabs from its newest capture. */
+export interface CompanionBrowser {
+  family: string;
+  /** Live native-messaging connection right now. */
+  connected: boolean;
+  last_captured_at: string | null;
+  last_snapshot_name: string | null;
+  tab_count: number;
+  tabs: CompanionTab[];
+}

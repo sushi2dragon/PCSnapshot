@@ -34,3 +34,8 @@ export async function getCaptureClipboard(): Promise<boolean> {
 export async function setCaptureClipboard(enabled: boolean): Promise<void> {
   return invoke<void>("set_capture_clipboard", { enabled });
 }
+
+/** Open a web URL in the user's default browser (http/https only). */
+export async function openExternal(url: string): Promise<void> {
+  return invoke<void>("open_external", { url });
+}

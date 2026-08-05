@@ -8,7 +8,7 @@
     "build": "tsc -b && node --import ./scripts/local-only.mjs ./node_modules/vite/bin/vite.js build",
     "lint": "eslint .",
     "preview": "node --import ./scripts/local-only.mjs ./node_modules/vite/bin/vite.js preview",
-    "test": "node --test --import ./scripts/no-network.mjs companion-extension/test/no-network.test.js companion-extension/test/capture.test.js companion-extension/test/restore.test.js",
+    "test": "node --test --import ./scripts/no-network.mjs test/glass-shell.test.js companion-extension/test/no-network.test.js companion-extension/test/capture.test.js companion-extension/test/restore.test.js",
     "test:companion": "npm run test",
     "build:companion": "node companion-extension/scripts/build-chromium.mjs",
     "tauri": "tauri"

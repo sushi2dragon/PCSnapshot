@@ -3,11 +3,19 @@ import { createPortal } from "react-dom";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { useIgnoreList } from "../hooks/useIgnoreList";
 import { useClipboard } from "../hooks/useClipboard";
-import { companionStatus, refreshCompanion } from "../commands/snapshots";
+import { useCompanion } from "../hooks/useCompanion";
+import { openExternal } from "../commands/config";
 import { KebabMenu } from "./KebabMenu";
-import type { ClipboardCacheRow, CompanionReport, SnapshotSummary } from "../types/snapshot";
+import type { ClipboardCacheRow, CompanionBrowser, SnapshotSummary } from "../types/snapshot";
 
-type Section = "general" | "ignore" | "capture" | "terminal" | "clipboard" | "storage" | "transfer" | "account" | "about";
+/** Placeholder for the eventual web-store listing. */
+const EXTENSION_INSTALL_URL = "https://google.com";
+
+type Section = "general" | "optins" | "ignore" | "capture" | "terminal" | "companion" | "clipboard" | "storage" | "transfer" | "account" | "about";
+
+/** Detail pages that only exist while their opt-in is on; their nav entries and
+ *  sections float into place when revealed. */
+const OPTIN_DETAIL = new Set<Section>(["terminal", "companion", "clipboard"]);
 
 type Props = {
   snapshots: SnapshotSummary[];
@@ -20,18 +28,6 @@ type Props = {
   onClose: () => void;
 };
 
-const sections: { key: Section; label: string }[] = [
-  { key: "general", label: "General" },
-  { key: "ignore", label: "Ignore List" },
-  { key: "capture", label: "Capture" },
-  { key: "terminal", label: "Terminal & Browser" },
-  { key: "clipboard", label: "Clipboard Cache" },
-  { key: "storage", label: "Storage" },
-  { key: "transfer", label: "Import & Export" },
-  { key: "account", label: "Plans & Account" },
-  { key: "about", label: "About & Help" },
-];
-
 function Toggle({ checked, label, onClick }: { checked: boolean; label: string; onClick: () => void }) {
   return <button className={`settings-toggle ${checked ? "on" : ""}`} role="switch" aria-checked={checked} aria-label={label} onClick={onClick}><span /></button>;
 }
@@ -40,52 +36,45 @@ function SettingRow({ title, description, action }: { title: string; description
   return <div className="setting-row"><div><strong>{title}</strong><p>{description}</p></div>{action && <div className="setting-row-action">{action}</div>}</div>;
 }
 
-/**
- * Live companion state. The companion used to fail silently — a stale native-host
- * registration or a service worker the browser had shut down both surfaced only
- * as a warning buried in a restore report. This row answers "is it working right
- * now?" directly, and re-runs setup on demand.
- */
-function CompanionRow() {
-  const [report, setReport] = useState<CompanionReport | null>(null);
-  const [checking, setChecking] = useState(true);
+const titleCase = (s: string) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
 
-  useEffect(() => {
-    let alive = true;
-    companionStatus()
-      .then(next => { if (alive) setReport(next); })
-      .catch(() => {})
-      .finally(() => { if (alive) setChecking(false); });
-    return () => { alive = false; };
-  }, []);
+/** Short host label for a tab URL (drops protocol and leading www.). */
+function tabHost(url: string): string {
+  try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return ""; }
+}
 
-  const recheck = useCallback(async () => {
-    setChecking(true);
-    try {
-      setReport(await refreshCompanion());
-    } catch {
-      setReport(null);
-    } finally {
-      setChecking(false);
-    }
-  }, []);
+function formatWhen(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "recently";
+  return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
 
-  const description = !report
-    ? "Checking the browser companion…"
-    : !report.host_installed
-      ? `The companion relay is missing at ${report.host_path}. Reinstall PC Snapshot to restore browser tabs.`
-      : report.connected_browsers.length > 0
-        ? `Connected to ${report.connected_browsers.join(", ")}. Browser tabs are captured and restored exactly.`
-        : "No browser is connected. Install the PC Snapshot Companion extension and open that browser; setup is registered for "
-          + `${report.registered_browsers.join(", ") || "no browsers"}.`;
-
-  return <SettingRow
-    title="Browser companion"
-    description={description}
-    action={<button className="settings-linkish" disabled={checking} onClick={() => { void recheck(); }}>
-      {checking ? "Checking…" : "Check again"}
-    </button>}
-  />;
+/** Connected/known browsers plus each one's most recently captured tabs — the
+ *  body of the Browser Companion settings page. */
+function CompanionBrowsers({ browsers, loading }: { browsers: CompanionBrowser[]; loading: boolean }) {
+  if (loading && browsers.length === 0) return <div className="settings-empty">Checking connected browsers…</div>;
+  if (browsers.length === 0) return <div className="settings-empty">No browser has connected yet. Install the extension and open your browser, then re-check.</div>;
+  return <>{browsers.map(b => (
+    <div className="companion-browser" key={b.family}>
+      <div className="companion-browser-head">
+        <div className="app-glyph">{b.family.slice(0, 2).toUpperCase()}</div>
+        <div className="companion-browser-copy">
+          <strong>{titleCase(b.family)}</strong>
+          <span>
+            {b.connected ? "Connected now" : b.last_captured_at ? `Last captured ${formatWhen(b.last_captured_at)}` : "Registered"}
+            {b.tab_count ? ` · ${b.tab_count} tab${b.tab_count === 1 ? "" : "s"}` : ""}
+          </span>
+        </div>
+        {b.connected && <span className="companion-dot" title="Connected now" />}
+      </div>
+      {b.tabs.length > 0 && <ul className="companion-tabs">
+        {b.tabs.map((t, i) => <li key={i}>
+          <span className="companion-tab-title">{t.title || tabHost(t.url) || "(untitled tab)"}</span>
+          <span className="companion-tab-url">{tabHost(t.url)}</span>
+        </li>)}
+      </ul>}
+    </div>
+  ))}</>;
 }
 
 export function SettingsPage(p: Props) {
@@ -106,6 +95,34 @@ export function SettingsPage(p: Props) {
   const [error, setError] = useState<string | null>(null);
   const { list, running, loading, add, remove, refresh } = useIgnoreList();
   const clip = useClipboard();
+  // Browser companion is connection-driven, not a toggle: its detail page appears
+  // once a browser has connected (or was captured before). `install` sends the
+  // user to the extension listing; `companion.refresh` re-checks the live status.
+  const companion = useCompanion();
+  const installCompanion = useCallback(() => { void openExternal(EXTENSION_INSTALL_URL).catch(() => {}); }, []);
+
+  // Nav + scroll-spy are driven off this list. The three opt-in detail pages are
+  // present only while their feature is active, so toggling one (or a browser
+  // connecting) mounts/unmounts both its nav entry and its section together.
+  const sections = useMemo<{ key: Section; label: string }[]>(() => [
+    { key: "general", label: "General" },
+    { key: "optins", label: "Opt-Ins" },
+    { key: "ignore", label: "Ignore List" },
+    { key: "capture", label: "Capture" },
+    ...(p.terminalHookEnabled ? [{ key: "terminal" as Section, label: "Terminal" }] : []),
+    ...(companion.active ? [{ key: "companion" as Section, label: "Browser Companion" }] : []),
+    ...(clip.enabled ? [{ key: "clipboard" as Section, label: "Clipboard Cache" }] : []),
+    { key: "storage", label: "Storage" },
+    { key: "transfer", label: "Import & Export" },
+    { key: "account", label: "Plans & Account" },
+    { key: "about", label: "About & Help" },
+  ], [p.terminalHookEnabled, companion.active, clip.enabled]);
+
+  // If the active page is an opt-in that was just turned off, its nav entry is
+  // gone; fall back to the Opt-Ins hub so the highlight never points at nothing.
+  useEffect(() => {
+    if (!sections.some(s => s.key === activeSection)) setActiveSection("optins");
+  }, [sections, activeSection]);
   // Copy feedback: the click is otherwise silent, and a silent button reads as
   // a broken one. Re-arms on every press so repeat copies each show a tick.
   const [copied, setCopied] = useState<{ id: string; ok: boolean } | null>(null);
@@ -164,12 +181,28 @@ export function SettingsPage(p: Props) {
     <button className="settings-close" aria-label="Close settings" onClick={close}>×</button>
     <nav className="settings-nav" aria-label="Settings sections">
       <div className="settings-nav-head"><span>Settings</span></div>
-      {sections.map(item => <button key={item.key} className={activeSection === item.key ? "active" : ""} aria-current={activeSection === item.key ? "location" : undefined} onClick={() => jumpToSection(item.key)}>{item.label}</button>)}
+      {sections.map(item => <button key={item.key} className={`${activeSection === item.key ? "active" : ""}${OPTIN_DETAIL.has(item.key) ? " nav-reveal" : ""}`} aria-current={activeSection === item.key ? "location" : undefined} onClick={() => jumpToSection(item.key)}>{item.label}</button>)}
     </nav>
     <div className="settings-content" ref={contentRef} onScroll={trackVisibleSection}>
       <section className="settings-section" id="settings-general">
         <header className="settings-heading"><div><h1>General</h1><p>PC Snapshot stays local, focused, and ready when you need it.</p></div></header>
         <div className="settings-card"><SettingRow title="Local-first storage" description="Snapshots, thumbnails, and activity remain on this PC. No account or cloud connection is used."/><SettingRow title="Refresh library" description="Reload snapshot metadata from local storage." action={<button className="settings-secondary" onClick={p.onRefresh}>Refresh now</button>}/></div>
+      </section>
+
+      <section className="settings-section" id="settings-optins">
+        <header className="settings-heading"><div><h1>Opt-Ins</h1><p>Optional features are off by default. Turn one on and its own settings page slides into the sidebar.</p></div></header>
+        <div className="settings-card">
+          <SettingRow title="Terminal directory capture" description="Adds a small PowerShell profile hook so terminal working directories can be restored." action={<Toggle checked={p.terminalHookEnabled} label="Terminal directory capture" onClick={p.onToggleTerminalHook}/>}/>
+          <SettingRow title="Browser companion" description="Capture and restore exact browser tabs through the PC Snapshot extension." action={
+            companion.connected
+              ? <span className="companion-badge"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>Connected</span>
+              : <div className="companion-actions">
+                  <button className="settings-primary" onClick={installCompanion}>Install extension</button>
+                  <button className="settings-linkish" disabled={companion.loading} onClick={() => { void companion.refresh(); }}>{companion.loading ? "Checking…" : "Recheck"}</button>
+                </div>
+          }/>
+          <SettingRow title="Clipboard cache" description="Store the clipboard and Win+V history with each snapshot and reseed it on restore." action={<Toggle checked={clip.enabled} label="Clipboard cache" onClick={() => { void clip.toggle(); }}/>}/>
+        </div>
       </section>
 
       <section className="settings-section" id="settings-ignore">
@@ -197,21 +230,30 @@ export function SettingsPage(p: Props) {
         <div className="settings-card"><SettingRow title="Parallel capture" description="Screenshots and window enumeration run together to keep capture under the three-second target."/><SettingRow title="Partial captures" description="A snapshot is still saved when one source fails; the exact warning is shown in Details."/></div>
       </section>
 
-      <section className="settings-section" id="settings-terminal">
-        <header className="settings-heading"><div><h1>Terminal & Browser</h1><p>Control optional context collection for richer restores.</p></div></header>
-        <div className="settings-card"><SettingRow title="PowerShell directory capture" description="Adds a small PowerShell profile hook so terminal working directories can be restored." action={<Toggle checked={p.terminalHookEnabled} label="PowerShell directory capture" onClick={p.onToggleTerminalHook}/>}/><CompanionRow/></div>
-      </section>
+      {p.terminalHookEnabled && <section className="settings-section settings-reveal" id="settings-terminal">
+        <header className="settings-heading"><div><h1>Terminal</h1><p>PowerShell working directories are recorded so terminals reopen where you left them.</p></div></header>
+        <div className="settings-card"><SettingRow title="PowerShell directory capture" description="A small PowerShell profile hook records each terminal's working directory. Turning this off removes the hook and hides this page." action={<Toggle checked={p.terminalHookEnabled} label="PowerShell directory capture" onClick={p.onToggleTerminalHook}/>}/></div>
+      </section>}
 
-      <section className="settings-section" id="settings-clipboard">
-        <header className="settings-heading"><div><h1>Clipboard Cache</h1><p>Optionally capture the clipboard and Win+V history with each snapshot, then reseed it on restore. Off means nothing is ever read or written — pinned Win+V items are always left untouched.</p></div></header>
-        <div className="settings-card"><SettingRow title="Capture clipboard" description="Store the current clipboard and Win+V history (text and images) inside snapshots, and reseed Win+V when you restore. Passwords marked sensitive by their app are never captured." action={<Toggle checked={clip.enabled} label="Capture clipboard" onClick={() => { void clip.toggle(); }}/>}/></div>
+      {companion.active && <section className="settings-section settings-reveal" id="settings-companion">
+        <header className="settings-heading">
+          <div><h1>Browser Companion</h1><p>Browsers connected through the PC Snapshot extension, with the tabs from their most recent capture.</p></div>
+          <button className="settings-secondary" disabled={companion.loading} onClick={() => { void companion.refresh(); }}>{companion.loading ? "Checking…" : "Check again"}</button>
+        </header>
+        {companion.report && !companion.report.host_installed && <div className="settings-error">The companion relay is missing at {companion.report.host_path}. Reinstall PC Snapshot to restore browser tabs.</div>}
+        <div className="companion-list">
+          <CompanionBrowsers browsers={companion.browsers} loading={companion.loading}/>
+        </div>
+      </section>}
+
+      {clip.enabled && <section className="settings-section settings-reveal" id="settings-clipboard">
+        <header className="settings-heading"><div><h1>Clipboard Cache</h1><p>The clipboard and Win+V history are captured with each snapshot and reseeded on restore. Passwords marked sensitive by their app are never captured; pinned Win+V items are left untouched.</p></div></header>
         {/* Bounded, self-scrolling panel: the cache grows with every snapshot and
             backup, so an unbounded list would push the rest of Settings off-screen. */}
-        <div className={`clip-cache-panel ${clip.enabled ? "" : "clip-cache-disabled"}`}>
-        <div className="clip-cache-head"><span>Saved items</span>{clip.enabled && !clip.loading && <span>{clip.rows.length} item{clip.rows.length === 1 ? "" : "s"}</span>}</div>
+        <div className="clip-cache-panel">
+        <div className="clip-cache-head"><span>Saved items</span>{!clip.loading && <span>{clip.rows.length} item{clip.rows.length === 1 ? "" : "s"}</span>}</div>
         <div className="clip-cache">
-          {!clip.enabled ? <div className="settings-empty">Turn on clipboard capture to browse and re-copy saved clipboard items.</div>
-            : clip.loading ? <div className="settings-empty">Loading clipboard items…</div>
+          {clip.loading ? <div className="settings-empty">Loading clipboard items…</div>
             : clip.rows.length === 0 ? <div className="settings-empty">No clipboard items captured yet.</div>
             : clip.rows.map(row => <div className="clip-cache-row" key={row.row_id}>
                 {row.kind === "image" && row.sidecar_path
@@ -231,7 +273,8 @@ export function SettingsPage(p: Props) {
               </div>)}
         </div>
         </div>
-      </section>
+        <div className="settings-card"><SettingRow title="Capture clipboard" description="Turning this off stops all clipboard capture and reseeding and hides this page. Nothing is read or written while off." action={<Toggle checked={clip.enabled} label="Capture clipboard" onClick={() => { void clip.toggle(); }}/>}/></div>
+      </section>}
 
       <section className="settings-section" id="settings-storage">
         <header className="settings-heading"><div><h1>Storage</h1><p>Manage snapshots stored on this PC.</p></div></header>

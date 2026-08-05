@@ -156,7 +156,13 @@ button,input{font:inherit}button{border:0;color:inherit}.app-frame{position:rela
 @keyframes settings-exit{from{opacity:1;transform:translateY(0) scale(1)}to{opacity:0;transform:translateY(10px) scale(.985)}}
 @keyframes settings-nav-enter{from{opacity:0;transform:translateX(-14px)}to{opacity:1;transform:translateX(0)}}
 @keyframes settings-content-enter{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
-@media(prefers-reduced-motion:reduce){.settings-overlay,.settings-overlay.closing,.settings-page,.settings-overlay.closing .settings-page,.settings-page .settings-nav,.settings-page .settings-content{animation:none}}
+/* Opt-in reveal: a freshly-enabled feature's nav tab slides in from the rail and
+   its detail section floats up, so turning on an opt-in reads as the page arriving. */
+.settings-nav>button.nav-reveal{animation:settings-nav-float .52s cubic-bezier(.16,.84,.28,1) both}
+.settings-section.settings-reveal{animation:settings-optin-float .52s cubic-bezier(.16,.84,.28,1) both}
+@keyframes settings-nav-float{from{opacity:0;transform:translateX(-16px)}to{opacity:1;transform:translateX(0)}}
+@keyframes settings-optin-float{from{opacity:0;transform:translateY(16px) scale(.984)}to{opacity:1;transform:translateY(0) scale(1)}}
+@media(prefers-reduced-motion:reduce){.settings-overlay,.settings-overlay.closing,.settings-page,.settings-overlay.closing .settings-page,.settings-page .settings-nav,.settings-page .settings-content,.settings-nav>button.nav-reveal,.settings-section.settings-reveal{animation:none}}
 
 /* Close sits on the panel itself, top-right — offset clears the content scrollbar. */
 .settings-close{position:absolute;top:13px;right:22px;z-index:3;width:32px;height:32px;display:grid;place-items:center;border-radius:8px;background:transparent;color:#8d96a2;font-size:22px;line-height:1;cursor:pointer;transition:background .14s ease,color .14s ease}
@@ -239,6 +245,23 @@ button,input{font:inherit}button{border:0;color:inherit}.app-frame{position:rela
 @keyframes picker-card-in{from{opacity:0;transform:translateY(12px) scale(.985)}to{opacity:1;transform:translateY(0) scale(1)}}
 @media(prefers-reduced-motion:reduce){.settings-picker,.settings-picker-card{animation:none}}
 .setting-row{min-height:76px;display:flex;align-items:center;justify-content:space-between;gap:24px;padding:15px 18px;border-bottom:1px solid #292c31}.setting-row:last-child{border-bottom:0}.setting-row strong{display:block;margin-bottom:4px;font-size:14px}.setting-row p{margin:0;color:#858d98;font-size:12px;line-height:1.45}.setting-row-action{flex:0 0 auto}
+
+/* Browser Companion — hub-row install/connected controls + detail-page browser list */
+.companion-actions{display:flex;align-items:center;gap:9px}
+.companion-badge{display:inline-flex;align-items:center;gap:6px;height:36px;padding:0 13px;border-radius:9px;background:rgba(70,201,139,.14);color:#5fd6a0;font-weight:600;font-size:13px;white-space:nowrap}
+.companion-list{margin-top:14px;display:flex;flex-direction:column;gap:12px}
+.companion-browser{border:1px solid #292c31;border-radius:12px;background:#1a1b1f;overflow:hidden}
+.companion-browser-head{display:flex;align-items:center;gap:12px;padding:12px 14px;border-bottom:1px solid #23262b}
+.companion-browser-head:only-child{border-bottom:0}
+.companion-browser-copy{flex:1;min-width:0}
+.companion-browser-copy strong{display:block;font-size:14px}
+.companion-browser-copy span{display:block;margin-top:2px;color:#858d98;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.companion-dot{flex:none;width:9px;height:9px;border-radius:50%;background:#46C98B;box-shadow:0 0 8px #46c98bcc}
+.companion-tabs{list-style:none;margin:0;padding:4px 0;max-height:230px;overflow:auto}
+.companion-tabs li{display:flex;align-items:baseline;gap:12px;padding:7px 14px 7px 52px;font-size:12.5px}
+.companion-tabs li:hover{background:#1e2024}
+.companion-tab-title{flex:1;min-width:0;color:#dce1e7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.companion-tab-url{flex:none;max-width:40%;color:#7f8792;font:11px var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 @media(max-width:760px){.settings-page{grid-template-columns:190px minmax(0,1fr)}.settings-content{padding:22px 18px}.settings-toolbar{flex-wrap:wrap}.settings-primary{width:100%}}
 
 @keyframes slideUp {
@@ -294,3 +317,47 @@ button,input{font:inherit}button{border:0;color:inherit}.app-frame{position:rela
 @media (prefers-reduced-motion: reduce) {
   .detail-actions button { transition: none; }
 }
+
+/* ── Glass shell ───────────────────────────────────────────────────────────
+   The window itself is transparent and carries a Mica/Acrylic system backdrop
+   (applied in lib.rs), so DWM — not CSS — supplies the blur. These layers only
+   need to be translucent for it to show through; backdrop-filter would be a
+   no-op here because the backdrop is not part of the page.
+
+   Snapshot tiles deliberately stay opaque: thumbnails are arbitrary desktop
+   imagery and their titles need a background that does not depend on the
+   user's wallpaper. */
+html,body,#root{background:transparent}
+.app-surface{height:100vh;background:transparent}
+.app-loading{background:transparent}
+.app-frame{background:transparent;border:0;border-radius:9px;box-shadow:inset 0 0 0 1px rgba(255,255,255,.07)}
+.sidebar{
+  background:linear-gradient(152deg,rgba(24,24,24,.34),rgba(24,24,24,.44));
+  border-right:1px solid rgba(255,255,255,.08);
+}
+
+/* See-through, not painted. The window carries a real Acrylic backdrop (verified
+   live: DWMWA_SYSTEMBACKDROP_TYPE = 3), which blurs the desktop behind it — the
+   app's job is to stay out of its way. Earlier versions stacked gradient "fog"
+   and grain on top, which is what made the panels read as flat grey: paint over
+   glass is just paint. The center therefore borrows Settings' soft diagonal
+   gradient at much lower alpha, while Acrylic supplies the actual foggy blur.
+   No backdrop-filter on these surfaces — over a transparent window region it
+   composites against nothing and can knock out the system backdrop entirely. */
+.center-panel{
+  background:linear-gradient(152deg,rgba(26,28,34,.18),rgba(26,28,34,.26));
+  border-right:1px solid rgba(255,255,255,.09);
+  box-shadow:inset 1px 0 0 rgba(255,255,255,.05);
+}
+.grid-header{background:rgba(4,10,20,.28);border-bottom:1px solid rgba(255,255,255,.09)}
+.search{background:rgba(0,0,0,.26);border-color:rgba(255,255,255,.12)}
+
+/* Activity uses the same Settings-inspired gradient, one step darker than the
+   library so it recedes without hiding the Acrylic backdrop. */
+.right-panel{
+  background:linear-gradient(152deg,rgba(15,23,37,.38),rgba(2,7,16,.48));
+  box-shadow:inset 1px 0 0 rgba(255,255,255,.05);
+}
+.panel-title{border-bottom:1px solid rgba(255,255,255,.08)}
+.detail-actions{border-top:1px solid rgba(255,255,255,.07)}
+.mission-empty .empty-mark{background:rgba(40,60,86,.55)}
