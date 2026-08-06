@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-const [appSource, cssSource, tauriConfigSource] = await Promise.all([
+const [appSource, cssSource, tauriConfigSource, missionControlSource] = await Promise.all([
   readFile(new URL("../src/App.tsx", import.meta.url), "utf8"),
   readFile(new URL("../src/index.css", import.meta.url), "utf8"),
   readFile(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"),
+  readFile(new URL("../src/components/MissionControl.tsx", import.meta.url), "utf8"),
 ]);
 
 function assertGlassShell({ app = appSource, css = cssSource, config = tauriConfigSource } = {}) {
@@ -33,7 +34,7 @@ function assertGlassShell({ app = appSource, css = cssSource, config = tauriConf
   assert.doesNotMatch(
     activityRule,
     /background-image\s*:\s*none/,
-    "Activity must not cancel its Settings-inspired gradient",
+    "Activity must not cancel its neutral glass gradient",
   );
 
   const finalBackgroundAlpha = (selector) => {
@@ -49,19 +50,52 @@ function assertGlassShell({ app = appSource, css = cssSource, config = tauriConf
   const centerAlpha = finalBackgroundAlpha(".center-panel");
   const sidebarAlpha = finalBackgroundAlpha(".sidebar");
   const activityAlpha = finalBackgroundAlpha(".right-panel");
-  assert.ok(centerAlpha <= 0.3, "the center must leave the native backdrop clearly visible");
-  assert.ok(sidebarAlpha <= 0.5, "the sidebar must remain translucent");
-  assert.ok(activityAlpha <= 0.55, "Activity must remain translucent");
+  assert.ok(centerAlpha <= 0.45, "the center must leave the native backdrop visible");
+  assert.ok(sidebarAlpha <= 0.6, "the sidebar must remain translucent");
+  assert.ok(activityAlpha <= 0.68, "Activity must remain translucent");
   assert.ok(sidebarAlpha - centerAlpha >= 0.12, "the sidebar must stay darker than the center");
   assert.ok(activityAlpha - centerAlpha >= 0.18, "Activity must stay darker than the center");
+
+  // The side rail and Activity panel carry an almost-black dark blue; the center
+  // library and its header stay neutral charcoal so they recede behind them.
+  const shellTones = {
+    ".sidebar": "12,15,28",
+    ".center-panel": "18,19,21",
+    ".grid-header": "18,19,21",
+    ".right-panel": "12,15,28",
+  };
+  for (const [selector, tone] of Object.entries(shellTones)) {
+    const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const rules = [...css.matchAll(new RegExp(`${escapedSelector}\\s*\\{([^}]*)\\}`, "gs"))];
+    const finalRule = rules.at(-1)?.[1] ?? "";
+    const rgbValues = [...finalRule.matchAll(/rgba\((\d+),(\d+),(\d+),/g)].map((match) => match.slice(1, 4).join(","));
+    assert.ok(rgbValues.length > 0 && rgbValues.every((rgb) => rgb === tone), `${selector} must use its shell glass tone (${tone})`);
+  }
+}
+
+function assertWallpaperSafeCards({ css = cssSource, missionControl = missionControlSource } = {}) {
+  assert.match(
+    missionControl,
+    /<div className="card-thumb">[\s\S]*?<\/div>\s*<div className="card-overlay">/,
+    "thumbnail imagery and metadata must be separate card regions",
+  );
+  assert.match(css, /\.card-thumb>img\s*\{[^}]*filter\s*:\s*brightness\([^}]*saturate\(/s);
+  assert.match(css, /\.snapshot-card:hover \.card-thumb>img[^}]*\{[^}]*filter\s*:\s*none/s);
+  assert.match(css, /\.detail-preview img\s*\{[^}]*filter\s*:\s*none!important/s);
+  assert.match(css, /\.card-scrim\s*\{[^}]*linear-gradient\(to top/s);
+  assert.match(css, /\.snapshot-card\s*\{[^}]*border-color\s*:\s*rgba\([^}]*box-shadow/s);
 }
 
 test("main and Activity surfaces leave the native Acrylic backdrop visible", () => {
   assertGlassShell();
 });
 
-test("Settings-inspired shell stays visibly translucent with a dark-blue hierarchy", () => {
+test("shell stays visibly translucent with a dark-blue rail/Activity over a charcoal center", () => {
   assertGlassShell();
+});
+
+test("grid thumbnails are controlled while hover and detail views restore the original", () => {
+  assertWallpaperSafeCards();
 });
 
 test("gate rejects the opaque React root that caused the resize-only glass", () => {

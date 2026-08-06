@@ -1948,7 +1948,11 @@ pub fn run() {
                     .set_effects(
                         EffectsBuilder::new()
                             .effect(Effect::Acrylic)
-                            .color(Color(12, 13, 16, 190))
+                            // Windows owns Acrylic's blur radius. This neutral fallback
+                            // tint is intentionally stronger so vivid wallpapers do not
+                            // push a warm or cool cast through the shell on versions that
+                            // honor the Acrylic color value.
+                            .color(Color(18, 19, 21, 215))
                             .build(),
                     )
                     .is_err()

@@ -139,7 +139,16 @@ button,input{font:inherit}button{border:0;color:inherit}.app-frame{position:rela
 
 .sidebar .settings-trigger{width:64px!important;height:52px;padding:0!important;color:#a8b7c8!important}
 .sidebar .settings-trigger:before{content:none!important}
-.sidebar .settings-trigger svg{display:block;margin:auto}
+.sidebar .settings-trigger svg{display:block;margin:auto;transform-origin:center}
+.sidebar .settings-trigger:hover,.sidebar .settings-trigger:focus-visible{background:var(--bg-tile)!important;color:#fff!important}
+.settings-trigger:hover svg{animation:settings-trigger-spin .38s cubic-bezier(.22,.8,.36,1)}
+.restore-rail-button:hover .rail-icon{animation:settings-trigger-spin .38s cubic-bezier(.22,.8,.36,1)}
+.capture-rail-button .rail-icon,.start-new-rail-button .rail-icon{transition:transform .18s cubic-bezier(.2,.8,.3,1.25)}
+.capture-rail-button:hover{background:color-mix(in srgb,var(--color-accent) 88%,white)}
+.capture-rail-button:hover .rail-icon,.start-new-rail-button:hover .rail-icon{transform:scale(1.18)}
+.start-new-rail-button:hover{background:transparent}
+@keyframes settings-trigger-spin{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){.settings-trigger:hover svg,.restore-rail-button:hover .rail-icon{animation:none}.capture-rail-button .rail-icon,.start-new-rail-button .rail-icon{transition:none}.capture-rail-button:hover .rail-icon,.start-new-rail-button:hover .rail-icon{transform:none}}
 
 /* Settings is a frosted overlay over the library, not a separate screen: the
    grid stays visible (and blurred) behind it so the panel reads as temporary. */
@@ -361,3 +370,83 @@ html,body,#root{background:transparent}
 .panel-title{border-bottom:1px solid rgba(255,255,255,.08)}
 .detail-actions{border-top:1px solid rgba(255,255,255,.07)}
 .mission-empty .empty-mark{background:rgba(40,60,86,.55)}
+
+/* ── Wallpaper-safe glass and snapshot cards ──────────────────────────────
+   Acrylic's blur radius is controlled by Windows, so a low-chroma tint does the
+   remaining work: it suppresses wallpaper colour while retaining the system blur
+   and translucency. The side rail and Activity panel carry an almost-black dark
+   blue (12,15,28); the center library stays neutral charcoal so it recedes. */
+.sidebar{
+  background:linear-gradient(152deg,rgba(12,15,28,.48),rgba(12,15,28,.56));
+}
+.center-panel{
+  background:linear-gradient(152deg,rgba(18,19,21,.34),rgba(18,19,21,.44));
+}
+.grid-header{background:rgba(18,19,21,.50)}
+.right-panel{
+  background:linear-gradient(152deg,rgba(12,15,28,.56),rgba(12,15,28,.64));
+}
+
+/* Restore the pre-f87200a image/content separation, then adapt it for glass. */
+.snapshot-card{
+  border-color:rgba(255,255,255,.14);
+  background:rgba(12,15,28,.96);
+  box-shadow:0 10px 28px rgba(0,0,0,.34),inset 0 1px 0 rgba(255,255,255,.06);
+}
+.snapshot-card:hover,.snapshot-card.selected,.snapshot-card.menu-open{
+  border-color:rgba(255,255,255,.27);
+  box-shadow:0 16px 36px rgba(0,0,0,.48),inset 0 1px 0 rgba(255,255,255,.06);
+}
+.snapshot-card.selected{border-color:color-mix(in srgb,var(--status) 52%,rgba(255,255,255,.22))}
+.card-thumb{
+  aspect-ratio:16/9;
+  border-radius:12px 12px 0 0;
+}
+.card-thumb>img{
+  filter:brightness(var(--norm,.9)) saturate(.80) contrast(1.04);
+  transform:scale(1.002);
+  transition:filter .22s ease,transform .22s ease;
+}
+.snapshot-card:hover .card-thumb>img,.snapshot-card.menu-open .card-thumb>img{
+  filter:none;
+  transform:none;
+}
+.detail-preview img{filter:none!important}
+.card-scrim{
+  background:linear-gradient(to top,rgba(12,15,28,.97) 0%,rgba(12,15,28,.82) 26%,rgba(12,15,28,.34) 46%,rgba(12,15,28,0) 66%);
+  opacity:1;
+  transition:opacity .22s ease;
+}
+.snapshot-card:hover .card-scrim,.snapshot-card.menu-open .card-scrim{opacity:0}
+.card-overlay{
+  position:relative;
+  inset:auto;
+  min-height:76px;
+  padding:10px 42px 10px 12px;
+  gap:4px;
+  border-top:1px solid rgba(255,255,255,.07);
+  border-radius:0 0 12px 12px;
+  background:linear-gradient(180deg,rgba(14,17,30,.96),rgba(11,14,26,.98));
+}
+.card-title{font-size:14px;text-shadow:none}
+.card-meta{color:#b7bdc5}
+.card-time{color:#858d98}
+.card-rename{
+  top:9px;
+  right:9px;
+  bottom:auto;
+  pointer-events:auto;
+  background:rgba(255,255,255,.055);
+}
+.status-chip{background:rgba(11,13,15,.84);backdrop-filter:blur(6px) saturate(.65)}
+
+/* Activity keeps status meaning, but body copy and links share one restrained
+   neutral range so the panel does not compete with the gallery. */
+.right-panel .event{color:#adb4bd}
+.right-panel .event-meta{color:#7f8791}
+.right-panel .event p{color:#a6adb6}
+.right-panel .event .success{color:#73bd98!important}
+.right-panel .event .warning{color:#c9a65f!important}
+.right-panel .event .failed{color:#c27a73!important}
+.right-panel .event-logs{color:#9aa5b1}
+.right-panel .event-logs:hover{color:#c2c8cf}

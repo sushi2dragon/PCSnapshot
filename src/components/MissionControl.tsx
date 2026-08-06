@@ -32,6 +32,65 @@ const absTime = (stamp: string) =>
 
 function Icon({ children }: { children: React.ReactNode }) { return <span className="rail-icon">{children}</span>; }
 
+// Screenshots vary wildly in mean luminance — a dark IDE vs. a white Explorer
+// window — so the single uniform dim applied in CSS makes bright captures glare
+// against the dark grid. We sample each thumbnail's average luminance once and
+// pull its resting brightness toward a shared target, dimming bright shots and
+// gently lifting dark ones so the grid reads as one surface. Measurement runs on
+// a detached crossOrigin image: if the webview taints the canvas the probe just
+// errors and we keep the CSS default, never touching the visible thumbnail.
+// Result is cached per URL (the URL carries the capture revision, so a recapture
+// re-measures automatically).
+const thumbNormCache = new Map<string, number>();
+
+function normFromLuma(luma: number): number {
+  const full = 0.42 / Math.max(luma, 0.05); // brightness that lands the mean on target
+  const b = 0.72 * 0.2 + full * 0.8;         // blend 80% normalized, 20% uniform dim
+  return Math.min(1.8, Math.max(0.55, b));
+}
+
+function measureThumbNorm(src: string): Promise<number | null> {
+  return new Promise(resolve => {
+    const probe = new Image();
+    probe.crossOrigin = "anonymous";
+    probe.onload = () => {
+      try {
+        const c = document.createElement("canvas");
+        c.width = 24; c.height = 15;
+        const ctx = c.getContext("2d", { willReadFrequently: true });
+        if (!ctx) return resolve(null);
+        ctx.drawImage(probe, 0, 0, c.width, c.height);
+        const { data } = ctx.getImageData(0, 0, c.width, c.height);
+        let sum = 0;
+        for (let i = 0; i < data.length; i += 4)
+          sum += 0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
+        resolve(normFromLuma(sum / (data.length / 4) / 255));
+      } catch { resolve(null); } // tainted canvas — degrade to the CSS default
+    };
+    probe.onerror = () => resolve(null);
+    probe.src = src;
+  });
+}
+
+// Thumbnail that self-normalizes its resting brightness via a CSS var (--norm);
+// falls back to the stylesheet default until/unless a measurement lands.
+function NormalizedThumb({ src }: { src: string }) {
+  const ref = useRef<HTMLImageElement>(null);
+  useEffect(() => {
+    let alive = true;
+    const set = (n: number) => { if (alive) ref.current?.style.setProperty("--norm", n.toFixed(3)); };
+    const cached = thumbNormCache.get(src);
+    if (cached != null) { set(cached); return; }
+    measureThumbNorm(src).then(n => {
+      if (n == null) return;
+      thumbNormCache.set(src, n);
+      set(n);
+    });
+    return () => { alive = false; };
+  }, [src]);
+  return <img ref={ref} src={src} alt="" />;
+}
+
 // Real exe icon for a captured app, resolved lazily and cached per path across
 // snapshots. Falls back to the two-letter monogram when the icon can't be read
 // (empty path, UWP stub, non-Windows) so a row always renders something.
@@ -135,9 +194,9 @@ export function MissionControl(p: Props) {
     </div>
     <>
     <aside className="sidebar">
-      <button className="rail-button active" onClick={p.onCapture}><Icon>◉</Icon><span>Capture</span></button>
-      <button className="rail-button" onClick={p.onStartNew}><Icon>＋</Icon><span>Start new</span></button>
-      <button className="rail-button" onClick={() => p.selectedId ? p.onRestore(p.selectedId) : setShowPicker(true)}><Icon>↻</Icon><span>Restore</span></button>
+      <button className="rail-button active capture-rail-button" onClick={p.onCapture}><Icon>◉</Icon><span>Capture</span></button>
+      <button className="rail-button start-new-rail-button" onClick={p.onStartNew}><Icon>＋</Icon><span>Start new</span></button>
+      <button className="rail-button restore-rail-button" onClick={() => p.selectedId ? p.onRestore(p.selectedId) : setShowPicker(true)}><Icon>↻</Icon><span>Restore</span></button>
       <div className="rail-spacer"/>
       <SettingsMenu open={showSettings} onToggle={() => setShowSettings(v => !v)}/>
     </aside>
@@ -155,19 +214,19 @@ export function MissionControl(p: Props) {
             style={{ "--status": status, "--status-ink": ink } as React.CSSProperties}
             onClick={() => p.onSelect(p.selectedId === s.id ? null : s.id)}>
             <div className="card-thumb">
-              {s.thumbnail_path ? <img src={thumbnailUrl(s.thumbnail_path, s.timestamp)} alt=""/> : <div className="thumb-placeholder"/>}
+              {s.thumbnail_path ? <NormalizedThumb src={thumbnailUrl(s.thumbnail_path, s.timestamp)}/> : <div className="thumb-placeholder"/>}
               <div className="card-scrim"/>
               <span className="status-chip"><i/>{chip}</span>
               <div className="card-hover"><button className="card-restore" onClick={e => {e.stopPropagation(); p.onRestore(s.id)}}>Restore</button></div>
-              <button className="card-rename" aria-label={`Rename ${s.name}`} title="Rename" onClick={e => {e.stopPropagation(); p.onRename(s.id)}}><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg></button>
-              <div className="card-overlay">
-                <strong className="card-title">{s.name}</strong>
-                <div className="card-apps">
-                  {apps.length > 0 && <span className="mini-stack">{apps.slice(0, 4).map(path => <MiniAppIcon key={path} path={path}/>)}</span>}
-                  <span className="card-meta">{s.app_count} app{s.app_count === 1 ? "" : "s"} · {s.monitor_count} monitor{s.monitor_count === 1 ? "" : "s"}</span>
-                </div>
-                <span className="card-time">{absTime(s.timestamp)}</span>
+            </div>
+            <div className="card-overlay">
+              <strong className="card-title">{s.name}</strong>
+              <div className="card-apps">
+                {apps.length > 0 && <span className="mini-stack">{apps.slice(0, 4).map(path => <MiniAppIcon key={path} path={path}/>)}</span>}
+                <span className="card-meta">{s.app_count} app{s.app_count === 1 ? "" : "s"} · {s.monitor_count} monitor{s.monitor_count === 1 ? "" : "s"}</span>
               </div>
+              <span className="card-time">{absTime(s.timestamp)}</span>
+              <button className="card-rename" aria-label={`Rename ${s.name}`} title="Rename" onClick={e => {e.stopPropagation(); p.onRename(s.id)}}><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg></button>
             </div>
             <button className="thumb-menu-btn" aria-label={`More actions for ${s.name}`} aria-haspopup="menu" aria-expanded={menuOpenId === s.id} title="More" onClick={e => {e.stopPropagation(); setMenuOpenId(id => id === s.id ? null : s.id)}}><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></button>
             {menuOpenId === s.id && <div className="card-menu" role="menu" onClick={e => e.stopPropagation()}>
